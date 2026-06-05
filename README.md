@@ -3,6 +3,7 @@
 This repository currently contains a trained YOLO detector checkpoint:
 
 - `best.pt`
+- `export_yolo_detection_manifest.py`
 
 Model details:
 
@@ -106,6 +107,59 @@ This writes an image with predicted boxes and labels.
 ```bash
 yolo predict model=best.pt source=example_image.png
 ```
+
+## Detection Manifest Export
+
+This repo also includes a helper script:
+
+- `export_yolo_detection_manifest.py`
+
+Purpose:
+
+- run detector inference over a folder of images
+- record every detected box
+- save confidence, class label, and original coordinates
+- optionally save one cropped patch per detection
+- optionally write one JSON file per source image
+
+Example:
+
+```bash
+python export_yolo_detection_manifest.py \
+  --dataset-root /path/to/images \
+  --output-root /path/to/output \
+  --model-path best.pt \
+  --device 0 \
+  --save-patches \
+  --per-image-json
+```
+
+Main outputs:
+
+- `detections.jsonl`
+  - one JSON object per detection
+- `images.jsonl`
+  - one JSON object per image
+- `per_image_json/`
+  - one JSON file per image when `--per-image-json` is used
+- `patches/`
+  - one saved crop per detection when `--save-patches` is used
+- `summary.json`
+  - run-level summary
+
+Each detection record includes fields such as:
+
+- `detection_id`
+- `case_id`
+- `image_id`
+- `bbox_xyxy_original`
+- `confidence`
+- `class_id`
+- `class_label`
+- `image_width`
+- `image_height`
+- `detector_checkpoint`
+- `patch_path`
 
 ### Notes
 
