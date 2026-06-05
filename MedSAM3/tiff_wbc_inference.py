@@ -31,10 +31,11 @@ Defaults (on by default, disable with --no-* flags):
 import argparse
 import csv
 import os
-import subprocess
 import sys
 import tempfile
 from pathlib import Path
+
+import torch
 
 
 # ---------------------------------------------------------------------------
@@ -176,36 +177,23 @@ def collect_tiff_files(data_root: Path, categories=None, cell_types=None):
 # Inference call
 # ---------------------------------------------------------------------------
 
-def run_medsam3_inference(medsam3_dir, config, image_path, output_path,
-                          prompt, threshold, nms_iou,
-                          wbc_mode=True, min_mask_area_frac=0.02,
-                          fallback_threshold=None, masked_output=False,
-                          fill_holes=False):
+def run_inference_direct(inferencer, image_path, output_path, prompt, masked_output):
     """
-    Call infer_sam.py as a subprocess.
-    Returns (success: bool, stderr: str)
+    Run inference with a pre-loaded SAM3LoRAInference instance.
+    Returns (success: bool, num_detections: int, error_str: str)
     """
-    infer_script = os.path.join(medsam3_dir, "infer_sam.py")
-    cmd = [
-        sys.executable, infer_script,
-        "--config",    str(config),
-        "--image",     str(image_path),
-        "--prompt",    prompt,
-        "--threshold", str(threshold),
-        "--nms-iou",   str(nms_iou),
-        "--output",    str(output_path),
-        "--min-mask-area-frac", str(min_mask_area_frac),
-    ]
-    if wbc_mode:
-        cmd.append("--wbc-mode")
-    if fallback_threshold is not None:
-        cmd += ["--fallback-threshold", str(fallback_threshold)]
-    if fill_holes:
-        cmd.append("--fill-holes")
+    inferencer.model.eval()
+    results = inferencer.predict(str(image_path), [prompt])
+    num_detections = sum(
+        r["num_detections"] for k, r in results.items() if k != "_image"
+    )
     if masked_output:
-        cmd.append("--masked-output")
-    result = subprocess.run(cmd, capture_output=True, text=True, cwd=medsam3_dir)
-    return result.returncode == 0, result.stderr
+        inferencer.save_masked_image(results, str(output_path))
+    else:
+        inferencer.visualize(results, str(output_path))
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    return True, num_detections, ""
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +212,20 @@ def main():
         sys.exit(f"[ERROR] data-root not found: {data_root}")
     if not config.exists():
         sys.exit(f"[ERROR] config not found: {config}")
+
+    sys.path.insert(0, str(medsam3_dir))
+    from infer_sam import SAM3LoRAInference
+
+    print("Loading MedSAM3 model (once)...")
+    inferencer = SAM3LoRAInference(
+        config_path=str(config),
+        detection_threshold=args.threshold,
+        nms_iou_threshold=args.nms_iou,
+        wbc_mode=args.wbc_mode,
+        min_mask_area_frac=args.min_mask_area_frac,
+        fallback_threshold=args.fallback_threshold,
+        fill_holes=args.fill_holes,
+    )
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -305,44 +307,49 @@ def main():
         else:
             infer_input = img_path
 
+        num_detections = 0
+        err = ""
         try:
-            ok, err = run_medsam3_inference(
-                medsam3_dir        = str(medsam3_dir),
-                config             = str(config),
-                image_path         = str(infer_input),
-                output_path        = str(out_mask_path),
-                prompt             = args.prompt,
-                threshold          = args.threshold,
-                nms_iou            = args.nms_iou,
-                wbc_mode           = args.wbc_mode,
-                min_mask_area_frac = args.min_mask_area_frac,
-                fallback_threshold = args.fallback_threshold,
-                masked_output      = args.masked_output,
-                fill_holes         = args.fill_holes,
+            ok, num_detections, err = run_inference_direct(
+                inferencer    = inferencer,
+                image_path    = infer_input,
+                output_path   = out_mask_path,
+                prompt        = args.prompt,
+                masked_output = args.masked_output,
             )
+        except Exception as exc:
+            ok, err = False, str(exc)
         finally:
             if tmp_path and tmp_path.exists():
                 tmp_path.unlink()
 
-        if ok:
-            success_cnt += 1
-            print(f"OK -> {out_mask_path.name}")
-        else:
+        if not ok:
+            status = "FAIL"
             print(f"FAIL: {err.strip()[-200:]}")
+        elif num_detections == 0:
+            status = "NO_DETECTION"
+            print(f"OK (no detection) -> {out_mask_path.name}")
+        else:
+            status = "OK"
+            success_cnt += 1
+            print(f"OK ({num_detections} det) -> {out_mask_path.name}")
 
         summary_rows.append({
-            "image":     img_path.name,
-            "category":  category,
-            "cell_type": cell_type,
-            "status":    "OK" if ok else "FAIL",
-            "mask_path": str(out_mask_path) if ok else "",
+            "image":          img_path.name,
+            "category":       category,
+            "cell_type":      cell_type,
+            "status":         status,
+            "num_detections": num_detections,
+            "fail_reason":    err.strip()[-300:] if not ok else "",
+            "mask_path":      str(out_mask_path) if ok else "",
         })
 
     # Save summary CSV
     csv_path = output_dir / "inference_summary.csv"
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(
-            f, fieldnames=["image", "category", "cell_type", "status", "mask_path"]
+            f, fieldnames=["image", "category", "cell_type", "status",
+                           "num_detections", "fail_reason", "mask_path"]
         )
         writer.writeheader()
         writer.writerows(summary_rows)
