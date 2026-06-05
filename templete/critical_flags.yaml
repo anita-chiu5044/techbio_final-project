@@ -1,0 +1,11 @@
+# Critical flags that should alter report handling or require escalation.
+# Keep entries structured and project-approved.
+
+critical_flags:
+  - id: ""
+    label: ""
+    severity: ""
+    criteria: ""
+    required_action: ""
+    approved_wording: ""
+    notes: ""

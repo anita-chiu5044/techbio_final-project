@@ -1,0 +1,24 @@
+# 重大旗標：影響報告處理、需要升級、複核或通知的條件。
+# 所有條目均需專案或領域同仁核准後才可啟用。
+
+critical_flags:
+  - id: ""
+    label: ""
+    severity: ""
+    status: 待領域同仁核准
+    criteria: ""
+    required_action: ""
+    approved_wording: ""
+    notify_role: ""
+    notes: ""
+
+severity_levels:
+  - id: routine
+    label: 一般
+    description: 可依一般報告流程處理。
+  - id: review
+    label: 需複核
+    description: 報告前需由指定角色複核。
+  - id: urgent
+    label: 緊急
+    description: 需依本院核准流程立即升級或通知。
