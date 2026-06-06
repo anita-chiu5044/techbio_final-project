@@ -33,8 +33,9 @@ python3 classifier_inference.py --image /path/to/cells/ --output results.csv
 | `--image` | （必填）| 單張影像路徑或資料夾 |
 | `--topk` | 3 | 輸出前幾名類別 |
 | `--output` | results.json | 輸出檔路徑 |
-| `--ckpt` | `./checkpoints_classifier/best_flat_convnext.pth` | 模型 checkpoint |
+| `--ckpt` | `artifacts/checkpoints/convnet/best_flat_convnext.pth` | 模型 checkpoint |
 | `--image_size` | 224 | 輸入影像 resize 大小 |
+| `--logit-adjustment` | false | 若 checkpoint 有 `class_freq`，推論前套用 class-frequency logit adjustment |
 
 ---
 
@@ -72,7 +73,7 @@ from torchvision import transforms
 import torch
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model, class_names = load_model("./checkpoints_classifier/best_flat_convnext.pth", device)
+model, class_names, class_freq = load_model("artifacts/checkpoints/convnet/best_flat_convnext.pth", device)
 
 tf = transforms.Compose([
     transforms.Resize((224, 224)),
@@ -80,7 +81,7 @@ tf = transforms.Compose([
     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
 ])
 
-result = predict_one("cell.jpg", model, class_names, tf, device, topk=3)
+result = predict_one("cell.jpg", model, class_names, tf, device, topk=3, class_freq=class_freq, use_logit_adjustment=True)
 # result["top1_class"]    → "apl_suspect"
 # result["top1_prob"]     → 0.863
 # result["predictions"]  → [{"rank":1, "class":..., "probability":...}, ...]
@@ -93,7 +94,7 @@ result = predict_one("cell.jpg", model, class_names, tf, device, topk=3)
 - 架構：ConvNeXt-Base
 - 輸入：224 × 224 px，RGB
 - 類別數：16
-- Checkpoint：`checkpoints_classifier/best_flat_convnext.pth`
+- Checkpoint：`artifacts/checkpoints/convnet/best_flat_convnext.pth`
 - Val accuracy：94.03%　｜　Val macro F1：0.877
 
 詳細類別說明請見 [README_classifier.md](README_classifier.md)

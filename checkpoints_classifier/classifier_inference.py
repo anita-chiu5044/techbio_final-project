@@ -24,12 +24,15 @@ from PIL import Image
 
 from train import build_convnext, build_resnet, build_efficientnet_v2, SimpleCNN
 
-DEFAULT_CKPT = "./checkpoints_classifier/best_flat_convnext.pth"
+DEFAULT_CKPT = Path(__file__).resolve().parents[2] / "artifacts" / "checkpoints" / "convnet" / "best_flat_convnext.pth"
 IMAGE_EXTS = {".tiff", ".tif", ".jpg", ".jpeg", ".png"}
 
 
 def load_model(ckpt_path, device):
-    ckpt = torch.load(ckpt_path, map_location=device)
+    try:
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+    except TypeError:
+        ckpt = torch.load(ckpt_path, map_location=device)
     class_names = ckpt["class_names"]
     model_name = ckpt.get("args", {}).get("model", "convnext")
     n = len(class_names)
@@ -47,13 +50,27 @@ def load_model(ckpt_path, device):
 
     model.load_state_dict(ckpt["model_state"])
     model.to(device).eval()
-    return model, class_names
+    class_freq = ckpt.get("class_freq")
+    return model, class_names, class_freq
 
 
-def predict_one(image_path, model, class_names, tf, device, topk=3):
+def apply_logit_adjustment(logits, class_freq, device):
+    if class_freq is None:
+        raise ValueError("checkpoint has no class_freq; cannot apply logit adjustment")
+    freq = torch.tensor(class_freq, device=device, dtype=logits.dtype)
+    if freq.numel() != logits.shape[1]:
+        raise ValueError("class_freq length does not match checkpoint class count")
+    return logits - torch.log(freq + 1e-7).unsqueeze(0)
+
+
+def predict_one(image_path, model, class_names, tf, device, topk=3, class_freq=None,
+                use_logit_adjustment=False):
     img = Image.open(image_path).convert("RGB")
     with torch.no_grad():
-        probs = F.softmax(model(tf(img).unsqueeze(0).to(device)), dim=1)[0]
+        logits = model(tf(img).unsqueeze(0).to(device))
+        if use_logit_adjustment:
+            logits = apply_logit_adjustment(logits, class_freq, device)
+        probs = F.softmax(logits, dim=1)[0]
 
     k = min(topk, len(class_names))
     top_probs, top_indices = probs.topk(k)
@@ -116,10 +133,12 @@ def main():
                         "Default: results.json next to --image")
     p.add_argument("--format",     default=None, choices=["json", "csv"],
                    help="Output format. Inferred from --output extension if not set.")
+    p.add_argument("--logit-adjustment", action="store_true",
+                   help="Apply checkpoint class-frequency logit adjustment before softmax.")
     args = p.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model, class_names = load_model(args.ckpt, device)
+    model, class_names, class_freq = load_model(args.ckpt, device)
 
     tf = transforms.Compose([
         transforms.Resize((args.image_size, args.image_size)),
@@ -134,7 +153,16 @@ def main():
 
     records = []
     for img_path in images:
-        result = predict_one(img_path, model, class_names, tf, device, args.topk)
+        result = predict_one(
+            img_path,
+            model,
+            class_names,
+            tf,
+            device,
+            args.topk,
+            class_freq=class_freq,
+            use_logit_adjustment=args.logit_adjustment,
+        )
         records.append(result)
 
         # Print to console

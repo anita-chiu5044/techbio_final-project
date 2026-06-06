@@ -1,168 +1,146 @@
-# TechBio Final Project
+# TechBio Final Project — Hematology Morphology Pipeline
 
-This repository currently contains a trained YOLO detector checkpoint:
+This repository contains the local computer-vision modules for the YMCA hematology morphology-review agent.
 
-- `best.pt`
-- `export_yolo_detection_manifest.py`
+Current scope: morphology-review support, not autonomous clinical diagnosis.
 
-Model details:
+```text
+Input image / cell crop
+  -> YOLO coarse detection: RBC / WBC / Platelets
+  -> ROI preprocessing for WBC candidates
+  -> MedSAM3 clean mask / transparent-background patch
+  -> ConvNet morphology classifier
+  -> downstream local agent DB/QC/reporting layer
+```
 
-- model type: YOLO11 detector
-- training dataset: BCCD (Blood Cell Count and Detection)
-- target classes:
-  - `RBC`
-  - `WBC`
-  - `Platelets`
+## Repository Layout
 
-Checkpoint purpose:
+```text
+.
+├── export_yolo_detection_manifest.py      # YOLO batch inference -> JSONL manifests
+├── yolo_to_medsam_patches.py              # YOLO WBC detections -> MedSAM TIFF input folders
+├── MedSAM3/                               # MedSAM3 / SAM3 LoRA inference code
+├── checkpoints_classifier/                # ConvNet inference, training, retraining orchestration
+├── scripts/                               # repo-level analysis utilities
+├── docs/                                  # checkpoint instructions and generated analysis reports
+├── templete/                              # domain/reporting templates from teammates
+└── .gitignore                             # excludes checkpoints, generated outputs, local data
+```
 
-- detect blood cells in microscope images
-- classify detected cells into the three BCCD classes above
+## Checkpoints Are Not Stored In Git
 
-Source path on the local machine:
+Large checkpoints must be downloaded or copied locally. See [docs/CHECKPOINTS.md](docs/CHECKPOINTS.md).
 
-- `/home/david9056/Desktop/Research/techbio/runs/bccd_yolo11l_pretrained/weights/best.pt`
+Expected local checkpoint paths:
 
-## How To Use The Checkpoint
+```text
+best.pt
+MedSAM3/outputs/sam3_lora_lisc/best_lora_weights.pt
+../artifacts/checkpoints/convnet/best_flat_convnext.pth
+```
 
-Requirements:
+## YOLO Detection
 
-- Python
-- `ultralytics`
-- `torch`
+YOLO is a coarse detector only. It predicts:
 
-Install example:
+```text
+RBC / WBC / Platelets
+```
+
+Run manifest export:
 
 ```bash
-pip install ultralytics
-```
-
-Load the checkpoint in Python:
-
-```python
-from ultralytics import YOLO
-
-model = YOLO("best.pt")
-```
-
-### Input
-
-Expected input:
-
-- a microscope image file
-- common formats such as `.png`, `.jpg`, `.jpeg`, `.tif`, `.tiff`
-- the model takes a full image and predicts bounding boxes for cells
-
-Example inference on one image:
-
-```python
-from ultralytics import YOLO
-
-model = YOLO("best.pt")
-results = model("example_image.png")
-```
-
-### Output
-
-For each detected object, the model returns:
-
-- bounding box coordinates
-- confidence score
-- predicted class
-
-Classes:
-
-- `RBC`
-- `WBC`
-- `Platelets`
-
-Example of reading predictions:
-
-```python
-from ultralytics import YOLO
-
-model = YOLO("best.pt")
-results = model("example_image.png")
-
-for box in results[0].boxes:
-    cls_id = int(box.cls.item())
-    conf = float(box.conf.item())
-    xyxy = box.xyxy[0].tolist()
-    print(model.names[cls_id], conf, xyxy)
-```
-
-### Save Annotated Output
-
-```python
-from ultralytics import YOLO
-
-model = YOLO("best.pt")
-results = model("example_image.png", save=True)
-```
-
-This writes an image with predicted boxes and labels.
-
-### Command Line Example
-
-```bash
-yolo predict model=best.pt source=example_image.png
-```
-
-## Detection Manifest Export
-
-This repo also includes a helper script:
-
-- `export_yolo_detection_manifest.py`
-
-Purpose:
-
-- run detector inference over a folder of images
-- record every detected box
-- save confidence, class label, and original coordinates
-- optionally save one cropped patch per detection
-- optionally write one JSON file per source image
-
-Example:
-
-```bash
-python export_yolo_detection_manifest.py \
-  --dataset-root /path/to/images \
-  --output-root /path/to/output \
-  --model-path best.pt \
-  --device 0 \
-  --save-patches \
-  --per-image-json
+python export_yolo_detection_manifest.py   --dataset-root /path/to/images   --output-root /path/to/yolo_output   --model-path best.pt   --device 0   --save-patches   --per-image-json
 ```
 
 Main outputs:
 
-- `detections.jsonl`
-  - one JSON object per detection
-- `images.jsonl`
-  - one JSON object per image
-- `per_image_json/`
-  - one JSON file per image when `--per-image-json` is used
-- `patches/`
-  - one saved crop per detection when `--save-patches` is used
-- `summary.json`
-  - run-level summary
+```text
+detections.jsonl
+images.jsonl
+summary.json
+patches/              # optional
+per_image_json/       # optional
+```
 
-Each detection record includes fields such as:
+Important: YOLO classes are not morphology labels. Only WBC candidates are downstream-eligible for MedSAM/ConvNet.
 
-- `detection_id`
-- `case_id`
-- `image_id`
-- `bbox_xyxy_original`
-- `confidence`
-- `class_id`
-- `class_label`
-- `image_width`
-- `image_height`
-- `detector_checkpoint`
-- `patch_path`
+## YOLO To MedSAM Preprocessing
 
-### Notes
+For the current classified-cell retraining dataset, each source image is expected to contain one labeled cell crop. The preprocessing keeps the highest-confidence WBC per source image:
 
-- this is a detection checkpoint, not a classifier-only checkpoint
-- it was trained on BCCD
-- it is intended to detect and classify `RBC`, `WBC`, and `Platelets`
+```bash
+python yolo_to_medsam_patches.py   --detections /path/to/yolo_output/detections.jsonl   --output-root /path/to/medsam_input   --context-scale 1.3
+```
+
+This top-1 shortcut is only for the current single-cell classified dataset. For real clinical sessions with full images or multiple cells, keep all WBC detections and create one downstream cell record per detection.
+
+## MedSAM3 Clean Patch Generation
+
+Example:
+
+```bash
+cd MedSAM3
+python tiff_wbc_inference.py   --data-root /path/to/medsam_input   --config configs/lisc_lora_config.yaml   --output-dir /path/to/medsam_output   --masked-output   --fill-holes   --erythroid-categories   --skip-existing
+```
+
+Main output:
+
+```text
+inference_summary.csv
+{category}/{cell_type}/{image_id}_mask.png
+```
+
+The summary CSV contract is:
+
+```text
+image, category, cell_type, status, num_detections, fail_reason, mask_path
+```
+
+## ConvNet Classifier Retraining
+
+Preferred entry point:
+
+```bash
+python checkpoints_classifier/retrain_pipeline.py   --summary-csv /home/yucheng/Desktop/techbio_pipeline_output/medsam_output/inference_summary.csv   --runs-dir /home/yucheng/Desktop/techbio_pipeline_output/convnet_runs
+```
+
+This runs preflight checks, mask QC reporting, four training configs, and comparison output.
+
+For details, see:
+
+```text
+checkpoints_classifier/README_classifier.md
+checkpoints_classifier/README_inference.md
+```
+
+## Pipeline Output Analysis
+
+After YOLO and MedSAM outputs exist:
+
+```bash
+python scripts/analyze_pipeline_outputs.py   --yolo-dir /home/yucheng/Desktop/techbio_pipeline_output/yolo   --medsam-dir /home/yucheng/Desktop/techbio_pipeline_output/medsam_output   --out-dir docs/analysis
+```
+
+Generated files:
+
+```text
+docs/analysis/pipeline_output_analysis.md
+docs/analysis/pipeline_output_analysis.json
+```
+
+
+## Reports And Reviews
+
+Current generated/review documents:
+
+```text
+docs/analysis/pipeline_output_analysis.md   # YOLO + MedSAM output statistics
+docs/INTEGRATION_CODE_REVIEW.md            # integration findings and remaining risks
+docs/REPO_STRUCTURE.md                     # what belongs in git vs local-only
+docs/CHECKPOINTS.md                        # checkpoint placement/download notes
+```
+
+## Safety Boundary
+
+This repository supports research and morphology-review workflow development. Outputs should be phrased as morphology-level suggestions and QC flags, not final diagnosis. Final clinical interpretation requires qualified human review and local SOP / confirmatory testing.

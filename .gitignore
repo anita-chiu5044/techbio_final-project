@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Environments
+.env
+.venv/
+venv/
+env/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Large model checkpoints - download/place locally instead
+/checkpoints_medsam/
+/checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+best.pt
+MedSAM3/outputs/
+artifacts/checkpoints/
+
+# Generated pipeline outputs
+runs/
+outputs/
+results/
+predictions/
+*_output/
+*_outputs/
+per_image_json/
+patches/
+medsam_input/
+medsam_output/
+convnet_runs/
+convnet_runs_*/
+*.jsonl
+inference_summary.csv
+mask_qc.csv
+medsam_status_by_class.csv
+preflight_summary.json
+mask_qc_summary.json
+comparison_report.txt
+*.log
+
+# Local data and reports that may be regenerated
+local_data/
+data/
+datasets/
+
+# Archives and generated classifier evaluation artifacts
+*.zip
+checkpoints_classifier/predictions_*.csv
+checkpoints_classifier/confusion_*.png

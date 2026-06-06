@@ -146,8 +146,8 @@ def collect_tiff_files(data_root: Path, categories=None, cell_types=None):
     Returns list of dicts:
         {path, category, cell_type, rel_path}
 
-    cell_type is inferred from the first 3 uppercase characters of the filename
-    (e.g. "NGS_0001.tiff" → "NGS").
+    cell_type is inferred from the second folder level when present
+    (e.g. granulocyte_mature/NGS/NGS_0001.tiff -> NGS).
     """
     records = []
     for tiff_path in sorted(data_root.rglob("*.tiff")):
@@ -155,8 +155,10 @@ def collect_tiff_files(data_root: Path, categories=None, cell_types=None):
         rel = tiff_path.relative_to(data_root)
         parts = rel.parts          # e.g. ('granulocyte_mature', 'NGS', 'NGS_0001.tiff')
                                    #   or ('lymphoid', 'LYA', 'ALL', 'LYA_0001.tiff')
-        category  = parts[0]
-        cell_type = tiff_path.stem[:3].upper()   # first 3 chars of filename
+        category = parts[0]
+        # Prefer folder label: {category}/{cell_type}/image.tiff. This is critical
+        # for LYA/ALL files named WBC-Malignant-..., where filename prefixes are not labels.
+        cell_type = parts[1] if len(parts) >= 2 else tiff_path.stem[:3].upper()
 
         if categories and category not in categories:
             continue
@@ -285,11 +287,13 @@ def main():
         if args.skip_existing and out_mask_path.exists():
             skip_cnt += 1
             summary_rows.append({
-                "image":     img_path.name,
-                "category":  category,
-                "cell_type": cell_type,
-                "status":    "SKIPPED",
-                "mask_path": str(out_mask_path),
+                "image":          img_path.name,
+                "category":       category,
+                "cell_type":      cell_type,
+                "status":         "SKIPPED",
+                "num_detections": 0,
+                "fail_reason":    "",
+                "mask_path":      str(out_mask_path),
             })
             continue
 
