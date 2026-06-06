@@ -22,7 +22,7 @@ import torch.nn.functional as F
 from torchvision import transforms
 from PIL import Image
 
-from train import build_convnext, build_resnet, build_efficientnet_v2, SimpleCNN
+from train import build_convnext, build_resnet, build_efficientnet_v2, build_dinobloom, SimpleCNN
 
 DEFAULT_CKPT = Path(__file__).resolve().parents[2] / "artifacts" / "checkpoints" / "convnet" / "best_flat_convnext.pth"
 IMAGE_EXTS = {".tiff", ".tif", ".jpg", ".jpeg", ".png"}
@@ -37,7 +37,9 @@ def load_model(ckpt_path, device):
     model_name = ckpt.get("args", {}).get("model", "convnext")
     n = len(class_names)
 
-    if model_name == "resnet101":
+    if model_name == "dinobloom":
+        model = build_dinobloom(n, ckpt_path=None, head_type="mlp")
+    elif model_name == "resnet101":
         model = build_resnet(n, variant=101, pretrained=False)
     elif model_name == "resnet50":
         model = build_resnet(n, variant=50, pretrained=False)

@@ -1,0 +1,19 @@
+# Urgent or expert-review triggers.
+# Add only project-approved trigger logic and wording.
+
+review_triggers:
+  - id: possible_apl
+    label: Possible APL
+    severity: urgent
+    trigger_terms: []
+    approved_wording: ""
+    required_action: ""
+    notes: ""
+
+  - id: critical_morphology_review
+    label: Critical morphology review
+    severity: urgent
+    trigger_terms: []
+    approved_wording: ""
+    required_action: ""
+    notes: ""

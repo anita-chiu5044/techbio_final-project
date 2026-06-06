@@ -1,0 +1,39 @@
+# 需要緊急複核或專家 review 的觸發條件。
+# 僅加入專案核准後的 trigger、文字與處理規則。
+
+review_triggers:
+  - id: possible_apl
+    label: 疑似急性前骨髓性白血病
+    abbreviation: APL
+    severity: urgent
+    status: 待領域同仁核准
+    trigger_terms: []
+    trigger_criteria: ""
+    approved_wording: ""
+    required_action: ""
+    notify_role: ""
+    notes: "若加入本項，需由領域同仁確認 trigger 條件、通知流程與可用文字。"
+
+  - id: critical_morphology_review
+    label: 重大形態學異常需複核
+    abbreviation: ""
+    severity: urgent
+    status: 待領域同仁核准
+    trigger_terms: []
+    trigger_criteria: ""
+    approved_wording: ""
+    required_action: ""
+    notify_role: ""
+    notes: ""
+
+  - id: discordant_result_review
+    label: 形態學與其他檢查結果不一致
+    abbreviation: ""
+    severity: review
+    status: 待領域同仁核准
+    trigger_terms: []
+    trigger_criteria: ""
+    approved_wording: ""
+    required_action: ""
+    notify_role: ""
+    notes: ""

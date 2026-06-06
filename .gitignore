@@ -19,6 +19,10 @@ Thumbs.db
 .vscode/
 .idea/
 
+# LLM models - download locally, never push
+/models/
+*.gguf
+
 # Large model checkpoints - download/place locally instead
 /checkpoints_medsam/
 /checkpoints/

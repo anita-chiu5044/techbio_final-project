@@ -47,6 +47,8 @@ def parse_args() -> argparse.Namespace:
                              "Use all for real user sessions; top1 is for legacy single-cell datasets.")
     parser.add_argument("--mapping-csv", type=Path, default=None,
                         help="Optional CSV mapping MedSAM output mask image path to agent cell_id.")
+    parser.add_argument("--exclude-ids", type=Path, default=None,
+                        help="JSON file with {gated_ids: [...]} — detection IDs to skip (YOLO gating).")
     return parser.parse_args()
 
 
@@ -110,8 +112,17 @@ def main() -> None:
     args = parse_args()
     args.output_root.mkdir(parents=True, exist_ok=True)
 
+    # Load gated (excluded) detection IDs
+    exclude_ids: set[str] = set()
+    if args.exclude_ids and args.exclude_ids.exists():
+        gated_data = json.loads(args.exclude_ids.read_text())
+        exclude_ids = set(gated_data.get("gated_ids", []))
+        print(f"Excluding {len(exclude_ids)} gated detection(s) (YOLO low confidence)")
+
     print(f"Loading detections and selecting WBC records (selection={args.selection})...")
     records = load_wbc_records(args.detections, args.wbc_label, args.selection)
+    if exclude_ids:
+        records = [r for r in records if r.get("detection_id") not in exclude_ids]
     print(f"Selected {len(records)} WBC detection(s)")
 
     saved = errors = 0

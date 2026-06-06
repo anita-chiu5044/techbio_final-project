@@ -63,7 +63,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-logit-adjustment", dest="logit_adjustment", action="store_false")
     parser.add_argument("--db", type=Path, default=None)
     parser.add_argument("--guidelines-dir", type=Path, default=DEFAULT_GUIDELINES)
-    parser.add_argument("--python-executable", default=sys.executable)
+    parser.add_argument("--python-executable", default=sys.executable,
+                        help="Default Python executable for pipeline stages.")
+    parser.add_argument("--yolo-python", default=None,
+                        help="Python executable for YOLO stage; use an env with ultralytics.")
+    parser.add_argument("--medsam-python", default=None,
+                        help="Python executable for MedSAM stage.")
+    parser.add_argument("--classifier-python", default=None,
+                        help="Python executable for classifier/agent bridge stage.")
+    parser.add_argument("--yolo-gate-conf", type=float, default=0.50,
+                        help="YOLO confidence threshold for downstream gating. "
+                             "Detections below this are imported but marked downstream_eligible=0 "
+                             "and queued for manual review. Set to 0 to disable gating.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print commands only. Does not run models or write DB updates.")
     parser.add_argument("--start-at", choices=["yolo", "roi", "medsam", "classifier", "agent"], default="yolo",
@@ -131,13 +142,41 @@ def ensure_case_and_import_yolo(args: argparse.Namespace, session: dict[str, Pat
 
     detections = read_jsonl(session["yolo"] / "detections.jsonl")
     imported = 0
+    gated = 0
+    gate_conf = getattr(args, "yolo_gate_conf", 0.50)
     for rec in detections:
         if rec.get("class_label") != "WBC":
             continue
         rec = {**rec, "case_id": args.session_id}
-        tools.import_yolo_detection(args.session_id, rec, cell_id=rec["detection_id"])
+        conf = float(rec.get("confidence", 0))
+        if gate_conf > 0 and conf < gate_conf:
+            # Low confidence — import but mark as not downstream-eligible
+            rec["downstream_eligible"] = False
+            tools.import_yolo_detection(args.session_id, rec, cell_id=rec["detection_id"])
+            # Mark for manual review
+            try:
+                tools.update_cell_review(
+                    rec["detection_id"],
+                    review_status="queued_for_review",
+                    note=f"YOLO confidence {conf:.3f} below gate threshold {gate_conf}",
+                    reviewer_id="pipeline_gate",
+                )
+            except Exception:
+                pass
+            gated += 1
+        else:
+            tools.import_yolo_detection(args.session_id, rec, cell_id=rec["detection_id"])
         imported += 1
-    print(f"Imported WBC YOLO detections into DB: {imported}")
+    print(f"Imported WBC YOLO detections: {imported} (gated: {gated} below conf={gate_conf})")
+    # Write gated detection IDs so ROI stage can skip them
+    if gated > 0:
+        gated_ids = []
+        for rec in detections:
+            if rec.get("class_label") == "WBC" and float(rec.get("confidence", 0)) < gate_conf:
+                gated_ids.append(rec["detection_id"])
+        (session["root"] / "gated_detections.json").write_text(
+            json.dumps({"gate_conf": gate_conf, "gated_ids": gated_ids}, indent=2)
+        )
     return tools
 
 
@@ -238,7 +277,7 @@ def main() -> None:
 
     if should_run(args, "yolo"):
         cmd = [
-            args.python_executable, REPO_ROOT / "export_yolo_detection_manifest.py",
+            args.yolo_python or args.python_executable, REPO_ROOT / "export_yolo_detection_manifest.py",
             "--dataset-root", dataset_root,
             "--output-root", session["yolo"],
             "--model-path", args.yolo_model,
@@ -257,18 +296,22 @@ def main() -> None:
         run(cmd, dry_run=args.dry_run)
 
     if should_run(args, "roi"):
-        run([
+        roi_cmd = [
             args.python_executable, REPO_ROOT / "yolo_to_medsam_patches.py",
             "--detections", session["yolo"] / "detections.jsonl",
             "--output-root", session["medsam_input"],
             "--context-scale", args.context_scale,
             "--selection", "all",
             "--mapping-csv", session["cell_map"],
-        ], dry_run=args.dry_run)
+        ]
+        gated_file = session["root"] / "gated_detections.json"
+        if gated_file.exists():
+            roi_cmd.extend(["--exclude-ids", gated_file])
+        run(roi_cmd, dry_run=args.dry_run)
 
     if should_run(args, "medsam"):
         cmd = [
-            args.python_executable, REPO_ROOT / "MedSAM3" / "tiff_wbc_inference.py",
+            args.medsam_python or args.python_executable, REPO_ROOT / "MedSAM3" / "tiff_wbc_inference.py",
             "--data-root", session["medsam_input"],
             "--config", args.medsam_config,
             "--output-dir", session["medsam_output"],
@@ -293,7 +336,7 @@ def main() -> None:
 
     if should_run(args, "classifier"):
         cmd = [
-            args.python_executable, REPO_ROOT / "scripts" / "run_classifier_agent_pipeline.py",
+            args.classifier_python or args.python_executable, REPO_ROOT / "scripts" / "run_classifier_agent_pipeline.py",
             "--image", session["medsam_output"],
             "--ckpt", args.classifier_ckpt,
             "--db", args.db or (session["root"] / "ymca_agent.db"),
