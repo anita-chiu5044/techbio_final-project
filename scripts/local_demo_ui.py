@@ -200,15 +200,20 @@ def apply_review(ctx: DemoContext, session_id: str, payload: dict) -> dict:
     if not cell_id:
         raise ValueError("cell_id is required")
     if action == "approve_gated":
-        # Approve a YOLO-gated cell: mark downstream_eligible=1 and reset review status
+        # Validate cell is actually gated
+        cell = tools.get_cell(cell_id)
+        if cell.get("downstream_eligible") or cell.get("review_status") != "queued_for_review":
+            raise ValueError(f"Cell {cell_id} is not gated (status={cell.get('review_status')})")
+        # Update downstream_eligible flag
         from ymca_agent.storage import connect as db_connect
         with db_connect(ctx.db_path(session_id)) as conn:
-            conn.execute(
-                "UPDATE cells SET downstream_eligible=1, review_status='unreviewed', "
-                "review_note=?, updated_at=CURRENT_TIMESTAMP WHERE cell_id=?",
-                (f"YOLO gating overridden by {reviewer_id}", cell_id),
-            )
-        result = {"action": "approve_gated", "cell_id": cell_id}
+            conn.execute("UPDATE cells SET downstream_eligible=1 WHERE cell_id=?", (cell_id,))
+        # Log via proper audit trail
+        result = tools.update_cell_review(
+            cell_id, review_status="unreviewed",
+            note="YOLO gating overridden — cell approved for downstream processing",
+            reviewer_id=reviewer_id,
+        )
         return {"review": result, "case": load_case(ctx, session_id)}
     elif action == "accept":
         result = tools.update_cell_review(cell_id, review_status="accepted_model_label", note=note, reviewer_id=reviewer_id)
@@ -223,6 +228,11 @@ def apply_review(ctx: DemoContext, session_id: str, payload: dict) -> dict:
     else:
         raise ValueError(f"unsupported review action: {action}")
     return {"review": result, "case": load_case(ctx, session_id)}
+
+
+def _fb(intent: dict, answer: str, case: dict, **extra) -> dict:
+    """Build a consistent fallback chat response."""
+    return {"mode": "fallback", "intent": intent, "answer": answer, "tool_trace": [], "case": case, **extra}
 
 
 def _handle_chat_fallback(ctx: DemoContext, session_id: str, message: str) -> dict:
@@ -243,10 +253,10 @@ def _handle_chat_fallback(ctx: DemoContext, session_id: str, message: str) -> di
             answer += "\nHard counts: " + ", ".join(f"{k}:{v}" for k, v in summary["hard_counts"].items())
         if summary.get("disease_warnings"):
             answer += "\nWarnings: " + "; ".join(summary["disease_warnings"])
-        return {"mode": "fallback", "intent": intent, "answer": answer, "data": summary, "case": load_case(ctx, session_id)}
+        return _fb(intent, answer, load_case(ctx, session_id), data=summary)
     if action == "report":
         report = tools.generate_case_report(case_id)
-        return {"mode": "fallback", "intent": intent, "answer": "已重新產生 morphology-review report。", "data": report["content"], "case": load_case(ctx, session_id)}
+        return _fb(intent, "已重新產生 morphology-review report。", load_case(ctx, session_id), data=report["content"])
     if action == "uncertain":
         cells = tools.list_uncertain_cells(case_id)
         if cells:
@@ -259,7 +269,7 @@ def _handle_chat_fallback(ctx: DemoContext, session_id: str, message: str) -> di
             answer = "\n".join(lines)
         else:
             answer = "目前沒有需要複核的細胞。"
-        return {"mode": "fallback", "intent": intent, "answer": answer, "data": cells, "case": load_case(ctx, session_id)}
+        return _fb(intent, answer, load_case(ctx, session_id), data=cells)
     if action == "cells":
         cells = tools.list_cells(case_id)
         answer = f"目前 case 有 {len(cells)} 顆 cell。"
@@ -269,7 +279,7 @@ def _handle_chat_fallback(ctx: DemoContext, session_id: str, message: str) -> di
                 lbl = c.get("model_label") or "unknown"
                 by_label[lbl] = by_label.get(lbl, 0) + 1
             answer += " Model predictions: " + ", ".join(f"{k}:{v}" for k, v in sorted(by_label.items()))
-        return {"mode": "fallback", "intent": intent, "answer": answer, "data": cells, "case": load_case(ctx, session_id)}
+        return _fb(intent, answer, load_case(ctx, session_id), data=cells)
     if action == "cell":
         cell_id = intent.get("cell_id")
         if not cell_id:
@@ -278,23 +288,31 @@ def _handle_chat_fallback(ctx: DemoContext, session_id: str, message: str) -> di
         answer = f"{cell_id}: model={cell.get('model_label','?')} ({(cell.get('top_probability',0)*100):.1f}%), status={cell.get('review_status','?')}"
         if cell.get("review_label"):
             answer += f", review_label={cell['review_label']}"
-        return {"mode": "fallback", "intent": intent, "answer": answer, "data": cell, "case": load_case(ctx, session_id)}
+        return _fb(intent, answer, load_case(ctx, session_id), data=cell)
     if action in {"accept", "correct", "exclude", "unclassifiable"}:
         review_payload = {"action": action, "cell_id": intent.get("cell_id"), "label": intent.get("label"), "reviewer_id": "demo_clinician"}
         result = apply_review(ctx, session_id, review_payload)
-        return {"mode": "fallback", "intent": intent, "answer": "已依照你的指示更新人工複核結果。", **result}
-    return {"mode": "fallback", "intent": intent, "answer": "我目前只能處理 summary/report/uncertain/cell/review 指令。", "case": load_case(ctx, session_id)}
+        return {**_fb(intent, "已依照你的指示更新人工複核結果。", result.get("case", load_case(ctx, session_id))), **result}
+    return _fb(intent, "我目前只能處理 summary/report/uncertain/cell/review 指令。", load_case(ctx, session_id))
 
 
 def handle_chat(ctx: DemoContext, session_id: str, message: str) -> dict:
     """Route chat to Qwen agent or deterministic fallback."""
     if ctx.qwen_agent is not None:
-        tools = ctx.tools(session_id)
-        case_id = ctx.case_id(session_id)
-        response = ctx.qwen_agent.chat(tools, case_id, message)
-        result = response.to_dict()
-        result["case"] = load_case(ctx, session_id)
-        return result
+        try:
+            tools = ctx.tools(session_id)
+            case_id = ctx.case_id(session_id)
+            response = ctx.qwen_agent.chat(tools, case_id, message)
+            result = response.to_dict()
+            result["case"] = load_case(ctx, session_id)
+            return result
+        except Exception as exc:
+            print(f"[QwenAgent] error: {exc}, falling back to deterministic handler")
+            traceback.print_exc()
+            fallback = _handle_chat_fallback(ctx, session_id, message)
+            fallback["qwen_error"] = str(exc)
+            fallback["mode"] = "fallback (qwen error)"
+            return fallback
     return _handle_chat_fallback(ctx, session_id, message)
 
 
@@ -304,9 +322,14 @@ def run_pipeline(ctx: DemoContext, fields: dict[str, str], files: list[tuple[str
     upload_dir.mkdir(parents=True, exist_ok=True)
     if not files:
         raise ValueError("At least one image file is required")
-    # Save all uploaded files
+    # Save all uploaded files (deduplicate names)
     for filename, content in files:
-        dest = upload_dir / Path(filename or "upload.png").name
+        base = Path(filename or "upload.png")
+        dest = upload_dir / base.name
+        counter = 1
+        while dest.exists():
+            dest = upload_dir / f"{base.stem}_{counter:03d}{base.suffix}"
+            counter += 1
         dest.write_bytes(content)
     # Input is the upload folder (YOLO processes all images in it)
     input_path = upload_dir
@@ -659,6 +682,7 @@ ${!c.downstream_eligible&&c.review_status==='queued_for_review'?`
     if(cvs){
       const ctx2=cvs.getContext('2d');
       const img=new Image();
+      img.onerror=()=>{ctx2.font='13px sans-serif';ctx2.fillStyle='#999';ctx2.fillText('Original image not available',10,30)};
       img.onload=()=>{
         cvs.width=img.naturalWidth;cvs.height=img.naturalHeight;
         cvs.style.maxWidth='100%';cvs.style.maxHeight='240px';
@@ -696,7 +720,9 @@ document.getElementById('uploadForm').addEventListener('submit',async e=>{e.prev
 
 async function fetchAgentStatus(){try{const s=await api('/api/agent_status');const el=document.getElementById('agentStatus');if(s.agent_mode==='qwen'&&s.qwen_available){el.textContent='Qwen3-14B'+(s.qwen_loaded?' (ready)':' (lazy)');el.style.color='#1e8449'}else{el.textContent='Fallback mode';el.style.color='#5d6d7e'}}catch{}}
 fetchAgentStatus();
-listSessions().then(()=>loadCase(currentSession));
+listSessions().then(()=>loadCase(currentSession)).catch(()=>{
+  document.getElementById('summary').innerHTML='<span class="muted">No sessions found. Upload an image to start.</span>';
+});
 </script>
 </body>
 </html>""".replace("__LABELS__", json.dumps(LABELS))
@@ -733,9 +759,19 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 # Browsers can't render TIFF — convert to PNG on the fly
                 if path.suffix.lower() in {".tiff", ".tif"}:
+                    if path.stat().st_size > 100_000_000:
+                        json_response(self, {"error": "Image too large (>100MB)"}, 413)
+                        return
                     from PIL import Image as PILImage
                     import io
                     with PILImage.open(path) as img:
+                        # Handle 16-bit grayscale (common in medical imaging)
+                        if img.mode in ("I;16", "I"):
+                            import numpy as np
+                            arr = np.array(img, dtype=np.float64)
+                            lo, hi = arr.min(), arr.max()
+                            arr = ((arr - lo) / max(hi - lo, 1) * 255).astype(np.uint8)
+                            img = PILImage.fromarray(arr)
                         img = img.convert("RGB")
                         buf = io.BytesIO()
                         img.save(buf, format="PNG")
@@ -752,7 +788,8 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 json_response(self, {"error": "not found"}, 404)
         except Exception as exc:
-            json_response(self, {"error": str(exc), "traceback": traceback.format_exc()}, 500)
+            traceback.print_exc()
+            json_response(self, {"error": str(exc)}, 500)
 
     def do_POST(self) -> None:
         try:
@@ -773,7 +810,8 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 json_response(self, {"error": "not found"}, 404)
         except Exception as exc:
-            json_response(self, {"error": str(exc), "traceback": traceback.format_exc()}, 500)
+            traceback.print_exc()
+            json_response(self, {"error": str(exc)}, 500)
 
     def log_message(self, fmt: str, *args) -> None:
         print(f"[demo-ui] {self.address_string()} - {fmt % args}")
