@@ -649,8 +649,11 @@ function renderDetail(){
   const bbox=c.bbox_xyxy_original;
   const origImg=currentCase.original_image;
   let bboxHtml='';
-  if(bbox&&bbox.length===4&&origImg){
-    bboxHtml=`<h3>Position on Original Image</h3><canvas id="bboxCanvas" class="bbox-canvas" width="400" height="400"></canvas>`;
+  if(origImg){
+    bboxHtml=`<h3>Position on Original Image <span class="muted" style="font-weight:400;text-transform:none">(drag to draw new bbox)</span></h3><canvas id="bboxCanvas" class="bbox-canvas" width="400" height="400" style="cursor:crosshair"></canvas>
+<div style="display:flex;gap:4px;margin-top:4px">
+<button onclick="deleteCurrentCell()" class="danger" style="font-size:11px">Delete this detection</button>
+</div>`;
   }
   d.innerHTML=`<img class="detail-img" src="${fileUrl(c.clean_patch_path||c.mask_path)}"/>
 <div style="font-weight:600;font-size:14px;margin-bottom:3px">${esc(c.cell_id)}</div>
@@ -676,36 +679,89 @@ ${!c.downstream_eligible&&c.review_status==='queued_for_review'?`
 <button onclick="review('unclassifiable')">Unclassifiable</button>
 </div>
 <div class="row" style="margin-top:5px"><select id="labelSelect">${labels.map(l=>`<option value="${l}">${l}</option>`).join('')}</select><button class="primary" onclick="review('correct')">Correct</button></div>`}`;
-  /* draw bbox on the ORIGINAL YOLO input image */
-  if(bbox&&bbox.length===4&&origImg){
+  /* draw bbox on the ORIGINAL YOLO input image with interactive drawing */
+  if(origImg){
     const cvs=document.getElementById('bboxCanvas');
     if(cvs){
       const ctx2=cvs.getContext('2d');
-      const img=new Image();
-      img.onerror=()=>{ctx2.font='13px sans-serif';ctx2.fillStyle='#999';ctx2.fillText('Original image not available',10,30)};
-      img.onload=()=>{
-        cvs.width=img.naturalWidth;cvs.height=img.naturalHeight;
-        cvs.style.maxWidth='100%';cvs.style.maxHeight='240px';
-        ctx2.drawImage(img,0,0);
-        /* draw all cell bboxes in grey first */
+      let bgImg=new Image();
+      let imgW=0,imgH=0;
+      bgImg.onerror=()=>{ctx2.font='13px sans-serif';ctx2.fillStyle='#999';ctx2.fillText('Original image not available',10,30)};
+      bgImg.onload=()=>{
+        imgW=bgImg.naturalWidth;imgH=bgImg.naturalHeight;
+        cvs.width=imgW;cvs.height=imgH;
+        cvs.style.maxWidth='100%';cvs.style.maxHeight='280px';
+        drawAllBoxes();
+      };
+      bgImg.src=fileUrl(origImg);
+
+      function drawAllBoxes(){
+        ctx2.drawImage(bgImg,0,0);
+        /* all cell bboxes in grey */
         (currentCase.cells||[]).forEach(oc=>{
-          if(oc.cell_id!==c.cell_id&&oc.bbox_xyxy_original&&oc.bbox_xyxy_original.length===4){
+          if(oc.bbox_xyxy_original&&oc.bbox_xyxy_original.length===4){
             const ob=oc.bbox_xyxy_original;
-            ctx2.strokeStyle='rgba(150,150,150,0.5)';ctx2.lineWidth=1;
+            const isSelected=currentCell&&oc.cell_id===currentCell.cell_id;
+            ctx2.strokeStyle=isSelected?'#ff3333':'rgba(150,150,150,0.5)';
+            ctx2.lineWidth=isSelected?3:1;
             ctx2.strokeRect(ob[0],ob[1],ob[2]-ob[0],ob[3]-ob[1]);
+            if(isSelected){
+              ctx2.font='bold 13px sans-serif';ctx2.fillStyle='#ff3333';
+              const lbl=(oc.model_label||'?')+' '+(oc.top_probability?(oc.top_probability*100).toFixed(0)+'%':'');
+              const ty=ob[1]>18?ob[1]-4:ob[3]+14;
+              ctx2.fillText(lbl,ob[0],ty);
+            }
           }
         });
-        /* draw selected cell bbox in red */
-        ctx2.strokeStyle='#ff3333';ctx2.lineWidth=3;
-        ctx2.strokeRect(bbox[0],bbox[1],bbox[2]-bbox[0],bbox[3]-bbox[1]);
-        ctx2.font='bold 14px sans-serif';ctx2.fillStyle='#ff3333';
-        const label=c.model_label+' '+(c.top_probability*100).toFixed(0)+'%';
-        const ty=bbox[1]>20?bbox[1]-6:bbox[3]+16;
-        ctx2.fillText(label,bbox[0],ty);
+      }
+
+      /* interactive bbox drawing */
+      let drawing=false,startX=0,startY=0;
+      function canvasCoord(e){
+        const r=cvs.getBoundingClientRect();
+        const scaleX=imgW/r.width,scaleY=imgH/r.height;
+        return[Math.round((e.clientX-r.left)*scaleX),Math.round((e.clientY-r.top)*scaleY)];
+      }
+      cvs.onmousedown=e=>{drawing=true;const[x,y]=canvasCoord(e);startX=x;startY=y};
+      cvs.onmousemove=e=>{
+        if(!drawing)return;
+        const[x,y]=canvasCoord(e);
+        drawAllBoxes();
+        ctx2.strokeStyle='#22c55e';ctx2.lineWidth=2;ctx2.setLineDash([6,3]);
+        ctx2.strokeRect(startX,startY,x-startX,y-startY);
+        ctx2.setLineDash([]);
       };
-      img.src=fileUrl(origImg);
+      cvs.onmouseup=async e=>{
+        if(!drawing)return;drawing=false;
+        const[x,y]=canvasCoord(e);
+        const bx=[Math.min(startX,x),Math.min(startY,y),Math.max(startX,x),Math.max(startY,y)];
+        const w=bx[2]-bx[0],h=bx[3]-bx[1];
+        if(w<10||h<10){drawAllBoxes();return}/* ignore tiny drags */
+        if(!confirm('Add manual WBC detection at this location?')){drawAllBoxes();return}
+        try{
+          const data=await api('/api/manual_detection',{method:'POST',body:JSON.stringify({
+            session_id:currentSession,bbox:bx,image_width:imgW,image_height:imgH,
+            source_image:currentCase.original_image
+          })});
+          currentCase=data.case;
+          currentCell=(currentCase.cells||[]).find(c=>c.cell_id===data.cell_id);
+          render();renderDetail();
+          document.getElementById('chatlog').innerHTML+=`<div class="muted">Manual detection added: ${esc(data.cell_id)} at [${bx.join(',')}]</div>`;
+        }catch(err){alert(err.message);drawAllBoxes()}
+      };
+      cvs.onmouseleave=()=>{if(drawing){drawing=false;drawAllBoxes()}};
     }
   }
+}
+
+async function deleteCurrentCell(){
+  if(!currentCell){alert('Select a cell first');return}
+  if(!confirm('Delete detection '+currentCell.cell_id+'? This cannot be undone.'))return;
+  try{
+    const data=await api('/api/delete_cell',{method:'POST',body:JSON.stringify({session_id:currentSession,cell_id:currentCell.cell_id})});
+    currentCase=data.case;currentCell=null;render();renderDetail();
+    document.getElementById('chatlog').innerHTML+=`<div class="muted">Detection deleted: ${esc(data.deleted)}</div>`;
+  }catch(e){alert(e.message)}
 }
 
 async function review(action){if(!currentCell){alert('Select a cell first');return}const body={session_id:currentSession,action,cell_id:currentCell.cell_id};if(action==='correct')body.label=document.getElementById('labelSelect').value;const data=await api('/api/review',{method:'POST',body:JSON.stringify(body)});currentCase=data.case;currentCell=(currentCase.cells||[]).find(c=>c.cell_id===body.cell_id);render();renderDetail()}
@@ -802,6 +858,46 @@ class Handler(BaseHTTPRequestHandler):
                 payload = parse_json_body(self)
                 session_id = safe_session_id(payload.get("session_id", "demo_case_ngs"))
                 json_response(self, handle_chat(self.ctx, session_id, payload.get("message", "")))
+            elif parsed.path == "/api/manual_detection":
+                payload = parse_json_body(self)
+                session_id = safe_session_id(payload.get("session_id", "demo_case_ngs"))
+                bbox = payload.get("bbox")  # [x1, y1, x2, y2] in original image coords
+                if not bbox or len(bbox) != 4:
+                    raise ValueError("bbox must be [x1, y1, x2, y2]")
+                tools = self.ctx.tools(session_id)
+                case_id = self.ctx.case_id(session_id)
+                # Generate unique manual detection ID
+                import time
+                det_id = f"manual_{int(time.time()*1000) % 1000000:06d}"
+                detection = {
+                    "detection_id": det_id,
+                    "case_id": case_id,
+                    "image_id": "manual",
+                    "source_image_path": payload.get("source_image", ""),
+                    "class_label": "WBC",
+                    "class_id": 0,
+                    "confidence": 1.0,
+                    "bbox_xyxy_original": bbox,
+                    "image_width": payload.get("image_width", 0),
+                    "image_height": payload.get("image_height", 0),
+                    "downstream_eligible": True,
+                }
+                tools.import_yolo_detection(case_id, detection, cell_id=det_id)
+                tools.update_cell_review(
+                    det_id, review_status="queued_for_review",
+                    note="Manually drawn bbox by reviewer",
+                    reviewer_id=payload.get("reviewer_id", "demo_clinician"),
+                )
+                json_response(self, {"cell_id": det_id, "bbox": bbox, "case": load_case(self.ctx, session_id)})
+            elif parsed.path == "/api/delete_cell":
+                payload = parse_json_body(self)
+                session_id = safe_session_id(payload.get("session_id", "demo_case_ngs"))
+                cell_id = payload.get("cell_id")
+                if not cell_id:
+                    raise ValueError("cell_id is required")
+                tools = self.ctx.tools(session_id)
+                tools.deactivate_cell(cell_id, note="Deleted by reviewer", reviewer_id=payload.get("reviewer_id", "demo_clinician"))
+                json_response(self, {"deleted": cell_id, "case": load_case(self.ctx, session_id)})
             elif parsed.path == "/api/run_pipeline":
                 body = read_body(self)
                 fields, files = parse_multipart(body, self.headers.get("Content-Type", ""))
