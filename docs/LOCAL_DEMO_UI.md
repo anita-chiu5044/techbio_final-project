@@ -52,6 +52,44 @@ YMCA_CLASSIFIER_PYTHON=/path/to/classifier/python \
 python scripts/local_demo_ui.py --port 8765
 ```
 
+
+## Optional Persistent Model Worker
+
+For faster reruns, start the local model worker before opening the UI. The first
+implemented persistent model is the DinoBloom classifier. YOLO remains lazy, and
+MedSAM still uses the existing CLI subprocess fallback because its inference
+script currently owns SAM3 + LoRA initialization internally.
+
+Start the worker in one terminal:
+
+```bash
+cd /home/yucheng/Desktop/techbio/techbio_final-project
+/home/yucheng/miniconda3/envs/techbio/bin/python scripts/model_worker.py \
+  --port 8777 \
+  --classifier-ckpt /home/yucheng/Desktop/techbio_pipeline_output/convnet_runs/dinobloom_ce_uniform/best.pth \
+  --preload-classifier
+```
+
+Then start the UI with the worker URL:
+
+```bash
+cd /home/yucheng/Desktop/techbio/techbio_final-project
+YMCA_CLASSIFIER_WORKER_URL=http://127.0.0.1:8777 \
+python scripts/local_demo_ui.py \
+  --port 8765 \
+  --medsam-python /home/yucheng/miniconda3/envs/techbio/bin/python \
+  --classifier-python /home/yucheng/miniconda3/envs/techbio/bin/python
+```
+
+You can check worker status with:
+
+```bash
+curl http://127.0.0.1:8777/status
+```
+
+If the worker is not running, omit `YMCA_CLASSIFIER_WORKER_URL` and the pipeline
+falls back to the previous classifier subprocess path.
+
 ## UI Features
 
 - Load an existing demo/session DB.

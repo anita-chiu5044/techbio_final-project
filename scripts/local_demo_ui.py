@@ -12,10 +12,12 @@ import json
 import mimetypes
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
 import traceback
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
@@ -33,18 +35,27 @@ from ymca_agent.qwen_agent import QwenAgent, AgentResponse  # noqa: E402
 
 DEFAULT_OUTPUT_ROOT = Path("/home/yucheng/Desktop/techbio_pipeline_output/full_agent_sessions")
 DEFAULT_UPLOAD_ROOT = Path("/home/yucheng/Desktop/techbio_pipeline_output/full_agent_uploads")
-DEFAULT_CLASSIFIER = Path("/home/yucheng/Desktop/techbio_pipeline_output/convnet_runs/dinobloom_ce_uniform/best.pth")
+DEFAULT_CLASSIFIER = Path("/home/yucheng/Desktop/techbio/artifacts/checkpoints/convnet/task_combine_dinobloom/best.pth")
 DEFAULT_GUIDELINES = WORKSPACE_ROOT / "reporting_guidelines"
 DEFAULT_YOLO_PYTHON = os.environ.get("YMCA_YOLO_PYTHON", "/home/yucheng/miniconda3/envs/AICUP/bin/python")
 DEFAULT_MEDSAM_PYTHON = os.environ.get("YMCA_MEDSAM_PYTHON", sys.executable)
 DEFAULT_CLASSIFIER_PYTHON = os.environ.get("YMCA_CLASSIFIER_PYTHON", sys.executable)
-LABELS = ["BAS", "EBO", "EOS", "KSC", "LYA", "LYT", "MMZ", "MOB", "MON", "MYB", "MYO", "NGB", "NGS", "PMB", "PMO"]
+DEFAULT_CLASSIFIER_WORKER_URL = os.environ.get("YMCA_CLASSIFIER_WORKER_URL")
+LABELS = [
+    "apl_suspect", "artifact", "basophil", "early_pre_b", "eosinophil",
+    "erythroid", "hematogone", "mature_lymphocyte", "monoblast", "monocyte",
+    "myeloblast", "myelocyte", "neutrophil", "other_immature", "pre_b", "pro_b",
+]
+
+
+VALID_PIPELINE_STAGES = {"yolo", "roi", "medsam", "classifier", "agent"}
+MAX_UPLOAD_BYTES = 500 * 1024 * 1024  # 500 MB
 
 
 def safe_session_id(value: str) -> str:
-    value = (value or "demo_case_ngs").strip()
+    value = (value or "demo_case_ngs").strip()[:80]
     value = re.sub(r"[^A-Za-z0-9_-]+", "_", value)
-    return value[:80] or "demo_case_ngs"
+    return value or "demo_case_ngs"
 
 
 def json_response(handler: BaseHTTPRequestHandler, payload: object, status: int = 200) -> None:
@@ -65,8 +76,10 @@ def text_response(handler: BaseHTTPRequestHandler, text: str, status: int = 200)
     handler.wfile.write(data)
 
 
-def read_body(handler: BaseHTTPRequestHandler) -> bytes:
+def read_body(handler: BaseHTTPRequestHandler, max_bytes: int = MAX_UPLOAD_BYTES) -> bytes:
     n = int(handler.headers.get("Content-Length", "0") or 0)
+    if n > max_bytes:
+        raise ValueError(f"Request body too large: {n} bytes (max {max_bytes})")
     return handler.rfile.read(n) if n else b""
 
 
@@ -106,6 +119,7 @@ def parse_multipart(body: bytes, content_type: str) -> tuple[dict[str, str], lis
 class DemoContext:
     def __init__(self, output_root: Path, upload_root: Path, guidelines_dir: Path, classifier_ckpt: Path,
                  yolo_python: str, medsam_python: str, classifier_python: str,
+                 classifier_worker_url: str | None = None,
                  agent_mode: str = "fallback", qwen_model_path: str | None = None,
                  qwen_load_in_4bit: bool = True) -> None:
         self.output_root = output_root
@@ -115,6 +129,7 @@ class DemoContext:
         self.yolo_python = yolo_python
         self.medsam_python = medsam_python
         self.classifier_python = classifier_python
+        self.classifier_worker_url = classifier_worker_url
         self.agent_mode = agent_mode
         self.qwen_agent: QwenAgent | None = None
         if agent_mode == "qwen" and qwen_model_path:
@@ -139,6 +154,29 @@ class DemoContext:
         if not db.exists():
             raise FileNotFoundError(f"No DB for session: {session_id}")
         with sqlite3.connect(db) as conn:
+            row = conn.execute(
+                """
+                SELECT c.case_id
+                FROM cases c
+                JOIN cells cell ON cell.case_id = c.case_id AND cell.is_current = 1
+                GROUP BY c.case_id
+                ORDER BY MAX(cell.updated_at) DESC, c.created_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            if row:
+                return str(row[0])
+            row = conn.execute(
+                """
+                SELECT active_case_id
+                FROM conversation_state
+                WHERE active_case_id IS NOT NULL
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            if row:
+                return str(row[0])
             row = conn.execute("SELECT case_id FROM cases ORDER BY created_at DESC LIMIT 1").fetchone()
         if not row:
             raise KeyError(f"No case row in session DB: {session_id}")
@@ -156,6 +194,18 @@ class DemoContext:
             return False
 
 
+def first_image_in_dir(path: Path) -> Path | None:
+    if not path.exists():
+        return None
+    if path.is_file() and path.suffix.lower() in {".tiff", ".tif", ".png", ".jpg", ".jpeg"}:
+        return path
+    if path.is_dir():
+        for f in sorted(path.iterdir()):
+            if f.suffix.lower() in {".tiff", ".tif", ".png", ".jpg", ".jpeg"}:
+                return f
+    return None
+
+
 def load_case(ctx: DemoContext, session_id: str) -> dict:
     session_id = safe_session_id(session_id)
     db = ctx.db_path(session_id)
@@ -165,18 +215,27 @@ def load_case(ctx: DemoContext, session_id: str) -> dict:
     tools = ctx.tools(session_id)
     summary = tools.summarize_case(case_id)
     cells = tools.list_cells(case_id)
+    for cell in cells:
+        for key in ("clean_patch_path", "mask_path"):
+            value = cell.get(key)
+            if value and not Path(value).exists():
+                cell[key] = None
     report = tools.generate_case_report(case_id)
     # Get original image path from cases table
     with sqlite3.connect(db) as conn:
         row = conn.execute("SELECT original_image_path FROM cases WHERE case_id=?", (case_id,)).fetchone()
     original_image = str(row[0]) if row else None
-    # Try session input_images symlink first (more reliable)
-    session_input = ctx.session_dir(session_id) / "input_images"
-    if session_input.exists():
-        for f in session_input.iterdir():
-            if f.suffix.lower() in {".tiff", ".tif", ".png", ".jpg", ".jpeg"}:
-                original_image = str(f.resolve())
-                break
+    original_candidates = [
+        ctx.session_dir(session_id) / "input_images",
+        ctx.upload_root / session_id,
+    ]
+    if original_image:
+        original_candidates.append(Path(original_image))
+    for candidate in original_candidates:
+        image = first_image_in_dir(candidate)
+        if image is not None:
+            original_image = str(image.resolve())
+            break
     return {
         "session_id": session_id,
         "case_id": case_id,
@@ -189,6 +248,47 @@ def load_case(ctx: DemoContext, session_id: str) -> dict:
         "classifier_checkpoint": str(ctx.classifier_ckpt),
     }
 
+
+
+
+def append_manual_detection_manifest(ctx: DemoContext, session_id: str, detection: dict) -> None:
+    """Persist a reviewer-drawn bbox so ROI reruns can process it."""
+    yolo_dir = ctx.session_dir(session_id) / "01_yolo"
+    yolo_dir.mkdir(parents=True, exist_ok=True)
+    manifest = yolo_dir / "detections.jsonl"
+    existing_ids: set[str] = set()
+    if manifest.exists():
+        with manifest.open() as handle:
+            for line in handle:
+                try:
+                    existing_ids.add(json.loads(line).get("detection_id", ""))
+                except json.JSONDecodeError:
+                    continue
+    if detection["detection_id"] in existing_ids:
+        return
+    with manifest.open("a") as handle:
+        handle.write(json.dumps(detection, ensure_ascii=False) + "\n")
+
+
+def case_owner_and_conversation(ctx: DemoContext, session_id: str, case_id: str) -> tuple[str, str]:
+    """Return a user/conversation pair already allowed to review this case."""
+    db = ctx.db_path(session_id)
+    with sqlite3.connect(db) as conn:
+        row = conn.execute("SELECT user_id FROM cases WHERE case_id=?", (case_id,)).fetchone()
+        user_id = str(row[0]) if row and row[0] else "demo_user"
+        conv = conn.execute(
+            """
+            SELECT cs.conversation_id
+            FROM conversation_state cs
+            JOIN conversations c ON c.conversation_id = cs.conversation_id
+            WHERE cs.active_case_id = ? AND (c.user_id = ? OR c.user_id IS NULL)
+            ORDER BY cs.updated_at DESC
+            LIMIT 1
+            """,
+            (case_id, user_id),
+        ).fetchone()
+    conversation_id = str(conv[0]) if conv else f"conv_{case_id}"
+    return user_id, conversation_id
 
 def apply_review(ctx: DemoContext, session_id: str, payload: dict) -> dict:
     tools = ctx.tools(session_id)
@@ -319,10 +419,17 @@ def handle_chat(ctx: DemoContext, session_id: str, message: str) -> dict:
 def run_pipeline(ctx: DemoContext, fields: dict[str, str], files: list[tuple[str, bytes]]) -> dict:
     session_id = safe_session_id(fields.get("session_id", "uploaded_case"))
     upload_dir = ctx.upload_root / session_id
+    session_input_dir = ctx.session_dir(session_id) / "input_images"
     upload_dir.mkdir(parents=True, exist_ok=True)
+    session_input_dir.mkdir(parents=True, exist_ok=True)  # keep existing images; accumulate
     if not files:
         raise ValueError("At least one image file is required")
-    # Save all uploaded files (deduplicate names)
+    saved_upload_files: list[str] = []
+    saved_session_files: list[str] = []
+    # Save all uploaded files in upload_root and mirror them into the persistent
+    # session artifact folder so bbox review/rerun can always find originals.
+    # The persistent input_images folder is reset per upload, so YOLO only sees
+    # files selected in this run. Filenames are still de-duplicated within both dirs.
     for filename, content in files:
         base = Path(filename or "upload.png")
         dest = upload_dir / base.name
@@ -331,8 +438,17 @@ def run_pipeline(ctx: DemoContext, fields: dict[str, str], files: list[tuple[str
             dest = upload_dir / f"{base.stem}_{counter:03d}{base.suffix}"
             counter += 1
         dest.write_bytes(content)
-    # Input is the upload folder (YOLO processes all images in it)
-    input_path = upload_dir
+        saved_upload_files.append(str(dest))
+
+        session_dest = session_input_dir / dest.name
+        session_counter = 1
+        while session_dest.exists():
+            session_dest = session_input_dir / f"{dest.stem}_{session_counter:03d}{dest.suffix}"
+            session_counter += 1
+        session_dest.write_bytes(content)
+        saved_session_files.append(str(session_dest))
+    # Input is the persistent session folder (YOLO processes all images in it).
+    input_path = session_input_dir
     cmd = [
         sys.executable, str(REPO_ROOT / "scripts" / "run_full_agent_pipeline.py"),
         "--input", str(input_path),
@@ -344,16 +460,22 @@ def run_pipeline(ctx: DemoContext, fields: dict[str, str], files: list[tuple[str
         "--classifier-ckpt", str(ctx.classifier_ckpt),
         "--logit-adjustment",
         "--output-root", str(ctx.output_root),
-        "--start-at", fields.get("start_at", "yolo"),
+        "--start-at", fields.get("start_at", "yolo") if fields.get("start_at", "yolo") in VALID_PIPELINE_STAGES else "yolo",
+        "--yolo-gate-conf", str(min(1.0, max(0.0, float(fields.get("yolo_gate_conf", "0.90") or "0.90")))),
         "--yolo-python", ctx.yolo_python,
         "--medsam-python", ctx.medsam_python,
         "--classifier-python", ctx.classifier_python,
     ]
+    if ctx.classifier_worker_url:
+        cmd.extend(["--classifier-worker-url", ctx.classifier_worker_url])
     proc = subprocess.run(cmd, cwd=REPO_ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     return {
         "session_id": session_id,
         "returncode": proc.returncode,
         "log": proc.stdout[-8000:],
+        "uploaded_files": saved_upload_files,
+        "session_input_files": saved_session_files,
+        "input_image_count": len(saved_session_files),
         "case": load_case(ctx, session_id) if proc.returncode == 0 else None,
     }
 
@@ -404,13 +526,17 @@ pre{white-space:pre-wrap;word-break:break-word;background:#f8fafc;padding:8px;bo
 .row{display:flex;gap:5px;align-items:center}
 .row>*{flex:1}
 /* --- cell list --- */
+.cell-section{border-bottom:1px solid var(--line)}
+.cell-section summary{cursor:pointer;padding:8px 10px;background:#f8fafc;font-size:12px;font-weight:700;color:var(--ink);display:flex;justify-content:space-between;align-items:center}
+.cell-section summary span{font-weight:500;color:var(--muted)}
+.cell-folder-empty{padding:10px;color:var(--muted);font-size:12px}
 .cell-card{display:grid;grid-template-columns:52px 1fr;gap:8px;padding:8px;border-bottom:1px solid #f5f5f5;cursor:pointer}
 .cell-card:hover{background:#f8fafc}
 .cell-card.active{background:var(--accent-light);border-left:3px solid var(--accent)}
 .thumb{width:52px;height:52px;object-fit:contain;background:#f9fafb;border:1px solid var(--line);border-radius:6px}
 /* --- detail --- */
 .detail-img{width:100%;max-height:200px;object-fit:contain;background:#f9fafb;border:1px solid var(--line);border-radius:8px;margin-bottom:8px}
-.bbox-canvas{width:100%;max-height:200px;object-fit:contain;border:1px solid var(--line);border-radius:8px;margin-bottom:6px;background:#f9fafb}
+.bbox-canvas{border:1px solid var(--line);border-radius:8px;margin-bottom:6px;background:#f9fafb;display:block}
 /* --- chat --- */
 .chatlog{flex:1;min-height:80px;overflow-y:auto;border:1px solid var(--line);border-radius:6px;padding:8px;background:#fafbfc;font-size:12px;line-height:1.5}
 .chatlog div{margin-bottom:5px}
@@ -447,11 +573,15 @@ pre{white-space:pre-wrap;word-break:break-word;background:#f8fafc;padding:8px;bo
 <div class='col'>
   <div class='col-hdr'>Session</div>
   <div class='col-body'>
-    <div class='row' style='margin-bottom:6px'><select id='sessionSelect' style='flex:2'></select><button onclick='loadSelected()'>Load</button></div>
+    <div style='margin-bottom:4px;font-size:11px' class='muted'>Active: <b id='activeSessionLabel' style='color:var(--ink)'></b></div>
+    <div class='row' style='margin-bottom:4px'>
+      <input id='newSessionInput' placeholder='New session name...' style='flex:2;margin-bottom:0'/>
+      <button onclick='newSession()' title='Create and switch to new session'>New</button>
+    </div>
+    <div class='row' style='margin-bottom:10px'><select id='sessionSelect' style='flex:2'></select><button onclick='loadSelected()'>Load</button></div>
     <details style='margin-bottom:10px'>
       <summary class='muted' style='cursor:pointer'>Upload & Run Pipeline</summary>
       <form id='uploadForm' style='margin-top:6px'>
-        <input name='session_id' placeholder='session id (e.g. patient_001)' value='uploaded_demo' style='margin-bottom:3px'/>
         <input name='image' type='file' accept='image/*,.tif,.tiff' multiple style='margin-bottom:3px'/>
         <p class='muted' style='margin:2px 0 4px'>Select one or more blood smear images. All detected WBC will be processed automatically.</p>
         <details>
@@ -463,6 +593,8 @@ pre{white-space:pre-wrap;word-break:break-word;background:#f8fafc;padding:8px;bo
             <option value='classifier'>Re-classify existing masks</option>
             <option value='agent'>Re-ingest into DB only</option>
           </select>
+          <label class='muted' style='display:block;margin-top:5px;font-size:10px'>YOLO gate confidence</label>
+          <input name='yolo_gate_conf' type='number' min='0' max='1' step='0.01' value='0.90'/>
         </details>
         <button class='primary' type='submit' style='width:100%;margin-top:6px'>Run Pipeline</button>
       </form>
@@ -626,15 +758,21 @@ function showPage(name){
 }
 
 /* --- session --- */
+function _setActiveSessionLabel(name){const el=document.getElementById('activeSessionLabel');if(el)el.textContent=name;}
 async function listSessions(){const d=await api('/api/sessions');const s=document.getElementById('sessionSelect');s.innerHTML='';d.sessions.forEach(n=>{const o=document.createElement('option');o.value=n;o.textContent=n;if(n===currentSession)o.selected=true;s.appendChild(o)})}
 async function loadSelected(){currentSession=document.getElementById('sessionSelect').value;await loadCase(currentSession)}
-async function loadCase(session){try{const d=await api('/api/case?session_id='+encodeURIComponent(session));currentCase=d;currentSession=session;render()}catch(e){alert(e.message)}}
+async function loadCase(session){try{const d=await api('/api/case?session_id='+encodeURIComponent(session));currentCase=d;currentSession=session;_setActiveSessionLabel(session);render()}catch(e){alert(e.message)}}
+function newSession(){const raw=(document.getElementById('newSessionInput').value||'').trim();if(!raw){alert('Enter a session name');return;}const name=raw.slice(0,80).replace(/[^A-Za-z0-9_-]+/g,'_')||'new_session';currentSession=name;currentCase=null;currentCell=null;_setActiveSessionLabel(name);document.getElementById('newSessionInput').value='';listSessions();render();}
 
-function render(){renderSummary();renderCells();renderReport();if(currentCell){currentCell=(currentCase.cells||[]).find(c=>c.cell_id===currentCell.cell_id);renderDetail()}}
+function render(){renderSummary();renderCells();renderReport();if(currentCell){currentCell=(currentCase.cells||[]).find(c=>c.cell_id===currentCell.cell_id)||null;if(currentCell)renderDetail()}}
 
-function renderSummary(){const s=currentCase.summary;document.getElementById('summary').innerHTML=[['Total cells',s.total_cells],['Review needed',s.review_needed_count],['Review-ready',s.hard_count_total],['Excluded',s.excluded_count]].map(([k,v])=>`<div class="stat-row"><span>${k}</span><b>${v}</b></div>`).join('')+'<div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:3px">'+Object.entries(s.hard_counts||{}).map(([k,v])=>`<span class="chip info">${esc(k)}:${v}</span>`).join('')+'</div>';const w=s.disease_warnings||[];document.getElementById('warnings').innerHTML=w.length?w.map(x=>`<div class="chip warn" style="margin:2px 0">${esc(x)}</div>`).join(''):'<span class="chip ok">OK</span>'}
+function renderSummary(){const s=currentCase.summary;if(!s)return;document.getElementById('summary').innerHTML=[['Total cells',s.total_cells],['Review needed',s.review_needed_count],['Review-ready',s.hard_count_total],['Excluded',s.excluded_count]].map(([k,v])=>`<div class="stat-row"><span>${k}</span><b>${v}</b></div>`).join('')+'<div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:3px">'+Object.entries(s.hard_counts||{}).map(([k,v])=>`<span class="chip info">${esc(k)}:${v}</span>`).join('')+'</div>';const w=s.disease_warnings||[];document.getElementById('warnings').innerHTML=w.length?w.map(x=>`<div class="chip warn" style="margin:2px 0">${esc(x)}</div>`).join(''):'<span class="chip ok">OK</span>'}
 
-function renderCells(){const box=document.getElementById('cells');box.innerHTML=(currentCase.cells||[]).map(c=>{const act=currentCell&&currentCell.cell_id===c.cell_id?' active':'';const reasons=(c.review_reasons||[]).map(r=>`<span class="chip warn">${esc(r)}</span>`).join('');const prob=c.top_probability!=null?(c.top_probability*100).toFixed(1)+'%':'';const isGated=!c.downstream_eligible&&c.review_status==='queued_for_review';const st=isGated?'<span class="chip warn">YOLO gated</span>':c.review_status==='accepted_model_label'?'<span class="chip ok">accepted</span>':c.review_status==='corrected'?`<span class="chip info">&rarr;${esc(c.review_label)}</span>`:c.review_status==='excluded'?'<span class="chip" style="color:var(--bad)">excluded</span>':'';const yoloConf=c.yolo_confidence!=null?` YOLO:${(c.yolo_confidence*100).toFixed(0)}%`:'';return`<div class="cell-card${act}" onclick="selectCell('${esc(c.cell_id)}')"><img class="thumb" src="${fileUrl(c.clean_patch_path||c.mask_path)}"/><div><div style="font-weight:600;font-size:12px">${esc(c.model_label||'pending')} <span class="muted">${prob}${isGated?yoloConf:''}</span></div><div class="muted" style="font-size:11px">${esc(c.cell_id)}</div><div style="margin-top:2px">${st}${reasons}</div></div></div>`}).join('')}
+function cellNeedsReview(c){return c.review_status==='queued_for_review'||c.review_status==='needs_senior_review'||((c.review_reasons||[]).length>0&&!['accepted_model_label','corrected','excluded','unclassifiable'].includes(c.review_status))||(!c.model_label&&c.review_status!=='excluded')}
+function cellIsClosed(c){return c.review_status==='excluded'||c.review_status==='unclassifiable'}
+function renderCellCard(c){const act=currentCell&&currentCell.cell_id===c.cell_id?' active':'';const reasons=(c.review_reasons||[]).map(r=>`<span class="chip warn">${esc(r)}</span>`).join('');const prob=c.top_probability!=null?(c.top_probability*100).toFixed(1)+'%':'';const isGated=!c.downstream_eligible&&c.review_status==='queued_for_review';const st=isGated?'<span class="chip warn">YOLO gated</span>':c.review_status==='accepted_model_label'?'<span class="chip ok">accepted</span>':c.review_status==='corrected'?`<span class="chip info">&rarr;${esc(c.review_label)}</span>`:c.review_status==='excluded'?'<span class="chip" style="color:var(--bad)">excluded</span>':c.review_status==='unclassifiable'?'<span class="chip warn">unclassifiable</span>':'';const yoloConf=c.yolo_confidence!=null?` YOLO:${(c.yolo_confidence*100).toFixed(0)}%`:'';const thumbSrc=c.clean_patch_path||c.mask_path;return`<div class="cell-card${act}" onclick="selectCell('${esc(c.cell_id)}')">${thumbSrc?`<img class="thumb" src="${fileUrl(thumbSrc)}"/>`:`<div class="thumb" style="display:flex;align-items:center;justify-content:center;font-size:10px;color:var(--muted)">manual</div>`}<div><div style="font-weight:600;font-size:12px">${esc(c.review_label||c.model_label||'pending')} <span class="muted">${prob}${yoloConf}</span></div><div class="muted" style="font-size:11px">${esc(c.cell_id)}</div><div style="margin-top:2px">${st}${reasons}</div></div></div>`}
+function renderCellSection(title,cells,open=true){const body=cells.length?cells.map(renderCellCard).join(''):`<div class="cell-folder-empty">No cells</div>`;return`<details class="cell-section" ${open?'open':''}><summary>${esc(title)} <span>${cells.length}</span></summary>${body}</details>`}
+function renderCells(){const box=document.getElementById('cells');const cells=currentCase.cells||[];const uncertain=cells.filter(c=>!cellIsClosed(c)&&cellNeedsReview(c));const closed=cells.filter(cellIsClosed);const confirmed=cells.filter(c=>!cellIsClosed(c)&&!cellNeedsReview(c));box.innerHTML=renderCellSection('Needs Review / 不確定',uncertain,true)+renderCellSection('Confirmed / 確定可用',confirmed,true)+renderCellSection('Excluded / 不納入',closed,false)}
 
 function renderReport(){document.getElementById('report').textContent=currentCase.report||''}
 
@@ -647,18 +785,28 @@ function renderDetail(){
   const bars=Object.entries(probs).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([k,v])=>`<div style="display:flex;align-items:center;gap:4px;margin:1px 0"><span style="width:32px;font-size:11px;text-align:right;font-weight:500">${esc(k)}</span><div style="flex:1;height:12px;background:#f3f4f6;border-radius:2px;overflow:hidden"><div style="height:100%;width:${(v*100).toFixed(1)}%;background:${k===c.model_label?'var(--accent)':'#cbd5e1'};border-radius:2px"></div></div><span class="muted" style="width:36px;font-size:10px">${(v*100).toFixed(1)}%</span></div>`).join('');
   /* bbox overlay on original YOLO input image */
   const bbox=c.bbox_xyxy_original;
-  const origImg=currentCase.original_image;
+  const origImg=c.roi_image_path||currentCase.original_image;
   let bboxHtml='';
   if(origImg){
     bboxHtml=`<h3>Position on Original Image <span class="muted" style="font-weight:400;text-transform:none">(drag to draw new bbox)</span></h3><canvas id="bboxCanvas" class="bbox-canvas" width="400" height="400" style="cursor:crosshair"></canvas>
-<div style="display:flex;gap:4px;margin-top:4px">
-<button onclick="deleteCurrentCell()" class="danger" style="font-size:11px">Delete this detection</button>
+<div style="display:flex;gap:4px;margin-top:4px;flex-wrap:wrap">
+<button onclick="deleteCurrentCell()" class="danger" style="font-size:11px">Mark as incorrect</button>
+<button onclick="hardDeleteCurrentCell()" class="danger" style="font-size:11px">Delete</button>
+<button onclick="rerunFromROI()" class="primary" style="font-size:11px">Re-run pipeline (ROI→MedSAM→Classifier)</button>
 </div>`;
   }
-  d.innerHTML=`<img class="detail-img" src="${fileUrl(c.clean_patch_path||c.mask_path)}"/>
+  const detailSrc=c.clean_patch_path||c.mask_path;
+  d.innerHTML=`${detailSrc?`<img class="detail-img" src="${fileUrl(detailSrc)}"/>`:`<div class="detail-img" style="display:flex;align-items:center;justify-content:center;color:var(--muted)">Manual detection — run pipeline to generate patch</div>`}
 <div style="font-weight:600;font-size:14px;margin-bottom:3px">${esc(c.cell_id)}</div>
 <div style="margin-bottom:2px;font-size:13px">Model: <b>${esc(c.model_label)}</b></div>
 <div class="muted" style="margin-bottom:4px">Status: ${esc(c.review_status)}${c.review_label?' &rarr; <b>'+esc(c.review_label)+'</b>':''}</div>
+<h3>Detection / Segmentation</h3>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;margin-bottom:6px;font-size:11px">
+  <div><span class="muted">YOLO class</span><br><b>${esc(c.yolo_class_name||'')}</b></div>
+  <div><span class="muted">YOLO confidence</span><br><b>${c.yolo_confidence!=null?(c.yolo_confidence*100).toFixed(1)+'%':'n/a'}</b></div>
+  <div><span class="muted">MedSAM status</span><br><b>${esc(c.segmentation_status||'pending')}</b></div>
+  <div><span class="muted">MedSAM quality</span><br><b>${c.segmentation_quality!=null?(c.segmentation_quality*100).toFixed(1)+'%':'n/a'}</b></div>
+</div>
 <h3>Top Probabilities</h3>${bars}
 <h3>QC Flags</h3>
 <div style="margin-bottom:6px">${(c.review_reasons||[]).map(r=>`<span class="chip warn">${esc(r)}</span>`).join('')||'<span class="chip ok">none</span>'}</div>
@@ -690,15 +838,22 @@ ${!c.downstream_eligible&&c.review_status==='queued_for_review'?`
       bgImg.onload=()=>{
         imgW=bgImg.naturalWidth;imgH=bgImg.naturalHeight;
         cvs.width=imgW;cvs.height=imgH;
-        cvs.style.maxWidth='100%';cvs.style.maxHeight='280px';
+        /* Set CSS size to maintain aspect ratio — prevents coordinate mismatch */
+        const containerW=cvs.parentElement.clientWidth;
+        const maxH=280;
+        const scale=Math.min(containerW/imgW,maxH/imgH,1);
+        cvs.style.width=(imgW*scale)+'px';
+        cvs.style.height=(imgH*scale)+'px';
         drawAllBoxes();
       };
       bgImg.src=fileUrl(origImg);
 
+      const cellSrcImg=(c.roi_image_path||'').replace(/\\\\/g,'/');
       function drawAllBoxes(){
         ctx2.drawImage(bgImg,0,0);
-        /* all cell bboxes in grey */
+        /* only draw cells whose source image matches this cell's source image */
         (currentCase.cells||[]).forEach(oc=>{
+          if(cellSrcImg&&(oc.roi_image_path||'').replace(/\\\\/g,'/')!==cellSrcImg)return;
           if(oc.bbox_xyxy_original&&oc.bbox_xyxy_original.length===4){
             const ob=oc.bbox_xyxy_original;
             const isSelected=currentCell&&oc.cell_id===currentCell.cell_id;
@@ -718,13 +873,16 @@ ${!c.downstream_eligible&&c.review_status==='queued_for_review'?`
       /* interactive bbox drawing */
       let drawing=false,startX=0,startY=0;
       function canvasCoord(e){
-        const r=cvs.getBoundingClientRect();
-        const scaleX=imgW/r.width,scaleY=imgH/r.height;
-        return[Math.round((e.clientX-r.left)*scaleX),Math.round((e.clientY-r.top)*scaleY)];
+        /* offsetX/offsetY = relative to element padding edge (excludes border)
+           clientWidth/clientHeight = CSS content box (excludes border)
+           cvs.width/height = internal buffer resolution */
+        const x=Math.round(e.offsetX/cvs.clientWidth*cvs.width);
+        const y=Math.round(e.offsetY/cvs.clientHeight*cvs.height);
+        return[Math.max(0,Math.min(imgW,x)),Math.max(0,Math.min(imgH,y))];
       }
-      cvs.onmousedown=e=>{drawing=true;const[x,y]=canvasCoord(e);startX=x;startY=y};
+      cvs.onmousedown=e=>{e.preventDefault();drawing=true;const[x,y]=canvasCoord(e);startX=x;startY=y};
       cvs.onmousemove=e=>{
-        if(!drawing)return;
+        if(!drawing)return;e.preventDefault();
         const[x,y]=canvasCoord(e);
         drawAllBoxes();
         ctx2.strokeStyle='#22c55e';ctx2.lineWidth=2;ctx2.setLineDash([6,3]);
@@ -732,7 +890,7 @@ ${!c.downstream_eligible&&c.review_status==='queued_for_review'?`
         ctx2.setLineDash([]);
       };
       cvs.onmouseup=async e=>{
-        if(!drawing)return;drawing=false;
+        if(!drawing)return;drawing=false;e.preventDefault();
         const[x,y]=canvasCoord(e);
         const bx=[Math.min(startX,x),Math.min(startY,y),Math.max(startX,x),Math.max(startY,y)];
         const w=bx[2]-bx[0],h=bx[3]-bx[1];
@@ -741,7 +899,7 @@ ${!c.downstream_eligible&&c.review_status==='queued_for_review'?`
         try{
           const data=await api('/api/manual_detection',{method:'POST',body:JSON.stringify({
             session_id:currentSession,bbox:bx,image_width:imgW,image_height:imgH,
-            source_image:currentCase.original_image
+            source_image:origImg
           })});
           currentCase=data.case;
           currentCell=(currentCase.cells||[]).find(c=>c.cell_id===data.cell_id);
@@ -754,17 +912,46 @@ ${!c.downstream_eligible&&c.review_status==='queued_for_review'?`
   }
 }
 
+let isRerunning=false;
+async function rerunFromROI(){
+  if(isRerunning){alert('Pipeline is already running');return}
+  if(!confirm('Re-run pipeline from ROI stage? This will re-process all detections through MedSAM and the classifier.'))return;
+  isRerunning=true;
+  const btn=document.querySelector('button[onclick="rerunFromROI()"]');
+  if(btn){btn.disabled=true;btn.textContent='Running...'}
+  const log=document.getElementById('chatlog');
+  log.innerHTML+='<div class="muted">Re-running pipeline from ROI stage...</div>';
+  log.scrollTop=log.scrollHeight;
+  try{
+    const data=await api('/api/rerun_pipeline',{method:'POST',body:JSON.stringify({session_id:currentSession,start_at:'roi'})});
+    if(data.case){currentCase=data.case;render();if(currentCell){currentCell=(currentCase.cells||[]).find(c=>c.cell_id===currentCell.cell_id)||null;renderDetail()}}
+    log.innerHTML+=`<div class="muted">Pipeline re-run complete (code ${data.returncode}).</div>`;
+  }catch(e){log.innerHTML+=`<div style="color:var(--bad)">Re-run failed: ${esc(e.message)}</div>`}
+  finally{isRerunning=false;if(btn){btn.disabled=false;btn.textContent='Re-run pipeline (ROI→MedSAM→Classifier)'}}
+  log.scrollTop=log.scrollHeight;
+}
+
 async function deleteCurrentCell(){
   if(!currentCell){alert('Select a cell first');return}
-  if(!confirm('Delete detection '+currentCell.cell_id+'? This cannot be undone.'))return;
+  if(!confirm('Mark '+currentCell.cell_id+' as incorrect detection? It will be excluded from analysis but remain visible.'))return;
   try{
     const data=await api('/api/delete_cell',{method:'POST',body:JSON.stringify({session_id:currentSession,cell_id:currentCell.cell_id})});
-    currentCase=data.case;currentCell=null;render();renderDetail();
-    document.getElementById('chatlog').innerHTML+=`<div class="muted">Detection deleted: ${esc(data.deleted)}</div>`;
+    currentCase=data.case;currentCell=(currentCase.cells||[]).find(c=>c.cell_id===data.excluded);render();renderDetail();
+    document.getElementById('chatlog').innerHTML+=`<div class="muted">Detection excluded: ${esc(data.excluded)}</div>`;
   }catch(e){alert(e.message)}
 }
 
-async function review(action){if(!currentCell){alert('Select a cell first');return}const body={session_id:currentSession,action,cell_id:currentCell.cell_id};if(action==='correct')body.label=document.getElementById('labelSelect').value;const data=await api('/api/review',{method:'POST',body:JSON.stringify(body)});currentCase=data.case;currentCell=(currentCase.cells||[]).find(c=>c.cell_id===body.cell_id);render();renderDetail()}
+async function hardDeleteCurrentCell(){
+  if(!currentCell){alert('Select a cell first');return}
+  if(!confirm('Delete '+currentCell.cell_id+' from the current review list? It will be deactivated but audit history remains in DB.'))return;
+  try{
+    const data=await api('/api/deactivate_cell',{method:'POST',body:JSON.stringify({session_id:currentSession,cell_id:currentCell.cell_id})});
+    currentCase=data.case;currentCell=null;render();renderDetail();
+    document.getElementById('chatlog').innerHTML+=`<div class="muted">Cell deleted from current list: ${esc(data.deactivated)}</div>`;
+  }catch(e){alert(e.message)}
+}
+
+async function review(action){if(!currentCell){alert('Select a cell first');return}const body={session_id:currentSession,action,cell_id:currentCell.cell_id};if(action==='correct')body.label=document.getElementById('labelSelect').value;try{const data=await api('/api/review',{method:'POST',body:JSON.stringify(body)});currentCase=data.case;currentCell=(currentCase.cells||[]).find(c=>c.cell_id===body.cell_id)||null;render();renderDetail()}catch(e){alert('Review failed: '+e.message)}}
 
 let isSending=false;
 async function sendChat(){if(isSending)return;const msg=document.getElementById('chatInput').value.trim();if(!msg)return;isSending=true;const btn=document.querySelector('#reviewPage .col:last-child button.primary');if(btn){btn.disabled=true;btn.textContent='Sending...'}document.getElementById('chatInput').value='';const log=document.getElementById('chatlog');log.innerHTML+=`<div><b>You:</b> ${esc(msg)}</div>`;log.innerHTML+=`<div class="muted" id="typing">Agent is thinking...</div>`;log.scrollTop=log.scrollHeight;try{const data=await api('/api/chat',{method:'POST',body:JSON.stringify({session_id:currentSession,message:msg})});document.getElementById('typing')?.remove();const tag=data.mode==='qwen'?'<span class="chip ok">Qwen</span>':'<span class="chip">fallback</span>';log.innerHTML+=`<div><b>Agent</b> ${tag}: ${esc(data.answer||'done')}</div>`;if(data.tool_trace&&data.tool_trace.length){log.innerHTML+=`<details><summary class="muted">${data.tool_trace.length} tool call(s)</summary><pre>${esc(JSON.stringify(data.tool_trace,null,2))}</pre></details>`}if(data.case){currentCase=data.case;render()}}catch(e){document.getElementById('typing')?.remove();log.innerHTML+=`<div style="color:var(--bad)"><b>Error:</b> ${esc(e.message)}</div>`}finally{isSending=false;if(btn){btn.disabled=false;btn.textContent='Send'}}log.scrollTop=log.scrollHeight}
@@ -772,11 +959,16 @@ async function sendChat(){if(isSending)return;const msg=document.getElementById(
 /* Enter key to send */
 document.getElementById('chatInput').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendChat()}});
 
-document.getElementById('uploadForm').addEventListener('submit',async e=>{e.preventDefault();const fd=new FormData(e.target);const sid=fd.get('session_id')||'uploaded_demo';const log=document.getElementById('chatlog');log.innerHTML+='<div class="muted">Running pipeline...</div>';try{const r=await fetch('/api/run_pipeline',{method:'POST',body:fd});const data=await r.json();if(!r.ok)throw new Error(data.error||'pipeline failed');currentSession=data.session_id||sid;await listSessions();if(data.case){currentCase=data.case;render()}log.innerHTML+=`<div class="muted">Pipeline done (code ${data.returncode}).</div>`}catch(err){alert(err.message)}});
+document.getElementById('uploadForm').addEventListener('submit',async e=>{e.preventDefault();const fd=new FormData(e.target);fd.set('session_id',currentSession);const fileCount=(e.target.querySelector('input[type=file]')?.files||[]).length;const log=document.getElementById('chatlog');log.innerHTML+=`<div class="muted">Running pipeline for ${fileCount} uploaded file(s) in session <b>${esc(currentSession)}</b>...</div>`;try{const r=await fetch('/api/run_pipeline',{method:'POST',body:fd});const data=await r.json();if(!r.ok)throw new Error(data.error||'pipeline failed');await listSessions();if(data.case){currentCase=data.case;render();showPage('review')}log.innerHTML+=`<div class="muted">Pipeline done (code ${data.returncode}); server received ${data.input_image_count??'?'} image file(s).</div>`}catch(err){alert(err.message)}});
 
 async function fetchAgentStatus(){try{const s=await api('/api/agent_status');const el=document.getElementById('agentStatus');if(s.agent_mode==='qwen'&&s.qwen_available){el.textContent='Qwen3-14B'+(s.qwen_loaded?' (ready)':' (lazy)');el.style.color='#1e8449'}else{el.textContent='Fallback mode';el.style.color='#5d6d7e'}}catch{}}
 fetchAgentStatus();
-listSessions().then(()=>loadCase(currentSession)).catch(()=>{
+_setActiveSessionLabel(currentSession);
+listSessions().then(()=>{
+  const sel=document.getElementById('sessionSelect');
+  const session=sel.value||currentSession;
+  return loadCase(session);
+}).catch(()=>{
   document.getElementById('summary').innerHTML='<span class="muted">No sessions found. Upload an image to start.</span>';
 });
 </script>
@@ -810,7 +1002,7 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/file":
                 raw = unquote(qs.get("path", [""])[0])
                 path = Path(raw)
-                if not raw or not path.exists() or not self.ctx.allowed_file(path):
+                if not raw or not self.ctx.allowed_file(path) or not path.exists():
                     json_response(self, {"error": "file not found or not allowed"}, 404)
                     return
                 # Browsers can't render TIFF — convert to PNG on the fly
@@ -843,9 +1035,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(data)
             else:
                 json_response(self, {"error": "not found"}, 404)
+        except (ValueError, KeyError, FileNotFoundError) as exc:
+            traceback.print_exc()
+            json_response(self, {"error": str(exc)}, 400)
         except Exception as exc:
             traceback.print_exc()
-            json_response(self, {"error": str(exc)}, 500)
+            json_response(self, {"error": "Internal server error"}, 500)
 
     def do_POST(self) -> None:
         try:
@@ -866,14 +1061,17 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("bbox must be [x1, y1, x2, y2]")
                 tools = self.ctx.tools(session_id)
                 case_id = self.ctx.case_id(session_id)
-                # Generate unique manual detection ID
-                import time
-                det_id = f"manual_{int(time.time()*1000) % 1000000:06d}"
+                det_id = f"manual_{uuid.uuid4().hex[:8]}"
+                source_image = payload.get("source_image", "")
+                if source_image and not self.ctx.allowed_file(Path(source_image)):
+                    raise ValueError("source_image path is not within allowed directories")
+                image_id = Path(source_image).stem or "manual"
                 detection = {
                     "detection_id": det_id,
                     "case_id": case_id,
-                    "image_id": "manual",
-                    "source_image_path": payload.get("source_image", ""),
+                    "image_id": image_id,
+                    "source_image_path": source_image,
+                    "source_image_relative_path": Path(source_image).name if source_image else "manual",
                     "class_label": "WBC",
                     "class_id": 0,
                     "confidence": 1.0,
@@ -883,6 +1081,7 @@ class Handler(BaseHTTPRequestHandler):
                     "downstream_eligible": True,
                 }
                 tools.import_yolo_detection(case_id, detection, cell_id=det_id)
+                append_manual_detection_manifest(self.ctx, session_id, detection)
                 tools.update_cell_review(
                     det_id, review_status="queued_for_review",
                     note="Manually drawn bbox by reviewer",
@@ -896,8 +1095,79 @@ class Handler(BaseHTTPRequestHandler):
                 if not cell_id:
                     raise ValueError("cell_id is required")
                 tools = self.ctx.tools(session_id)
-                tools.deactivate_cell(cell_id, note="Deleted by reviewer", reviewer_id=payload.get("reviewer_id", "demo_clinician"))
-                json_response(self, {"deleted": cell_id, "case": load_case(self.ctx, session_id)})
+                # Mark as excluded (still visible in list) rather than hard delete
+                result = tools.update_cell_review(
+                    cell_id, review_status="excluded",
+                    note="Detection marked incorrect by reviewer",
+                    reviewer_id=payload.get("reviewer_id", "demo_clinician"),
+                )
+                json_response(self, {"excluded": cell_id, "case": load_case(self.ctx, session_id)})
+            elif parsed.path == "/api/deactivate_cell":
+                payload = parse_json_body(self)
+                session_id = safe_session_id(payload.get("session_id", "demo_case_ngs"))
+                cell_id = payload.get("cell_id")
+                if not cell_id:
+                    raise ValueError("cell_id is required")
+                tools = self.ctx.tools(session_id)
+                tools.deactivate_cell(
+                    cell_id,
+                    note="Cell deleted from current review list by reviewer",
+                    reviewer_id=payload.get("reviewer_id", "demo_clinician"),
+                )
+                json_response(self, {"deactivated": cell_id, "case": load_case(self.ctx, session_id)})
+            elif parsed.path == "/api/rerun_pipeline":
+                payload = parse_json_body(self)
+                session_id = safe_session_id(payload.get("session_id", ""))
+                start_at = payload.get("start_at", "roi")
+                if start_at not in VALID_PIPELINE_STAGES:
+                    raise ValueError(f"Invalid start_at: {start_at!r}")
+                session_dir = self.ctx.session_dir(session_id)
+                if not session_dir.exists():
+                    raise ValueError(f"Session not found: {session_id}")
+                # session_id = directory name (for file paths)
+                # case_id = DB identifier (may differ from session_id)
+                # Pass both so paths resolve correctly without creating/reading
+                # a different case after rerun.
+                case_id = self.ctx.case_id(session_id)
+                case_user_id, conversation_id = case_owner_and_conversation(self.ctx, session_id, case_id)
+                input_path = session_dir / "input_images"
+                if not first_image_in_dir(input_path):
+                    with sqlite3.connect(self.ctx.db_path(session_id)) as conn:
+                        row = conn.execute("SELECT original_image_path FROM cases WHERE case_id=?", (case_id,)).fetchone()
+                    db_input = Path(row[0]) if row and row[0] else None
+                    if db_input and first_image_in_dir(db_input):
+                        input_path = db_input
+                    else:
+                        raise ValueError(f"Original input image not found for session: {session_id}")
+                cmd = [
+                    sys.executable, str(REPO_ROOT / "scripts" / "run_full_agent_pipeline.py"),
+                    "--input", str(input_path),
+                    "--session-id", session_id,
+                    "--case-id", case_id,
+                    "--user-id", case_user_id,
+                    "--conversation-id", conversation_id,
+                    "--yolo-model", str(REPO_ROOT / "best.pt"),
+                    "--medsam-config", str(REPO_ROOT / "MedSAM3" / "configs" / "lisc_lora_config.yaml"),
+                    "--medsam3-dir", str(REPO_ROOT / "MedSAM3"),
+                    "--classifier-ckpt", str(self.ctx.classifier_ckpt),
+                    "--logit-adjustment",
+                    "--output-root", str(self.ctx.output_root),
+                    "--start-at", start_at,
+                    "--db", str(self.ctx.db_path(session_id)),
+                    "--yolo-python", self.ctx.yolo_python,
+                    "--medsam-python", self.ctx.medsam_python,
+                    "--classifier-python", self.ctx.classifier_python,
+                ]
+                if self.ctx.classifier_worker_url:
+                    cmd.extend(["--classifier-worker-url", self.ctx.classifier_worker_url])
+                proc = subprocess.run(cmd, cwd=REPO_ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                result = {
+                    "session_id": session_id,
+                    "returncode": proc.returncode,
+                    "log": proc.stdout[-8000:],
+                    "case": load_case(self.ctx, session_id) if proc.returncode == 0 else None,
+                }
+                json_response(self, result, status=200 if proc.returncode == 0 else 500)
             elif parsed.path == "/api/run_pipeline":
                 body = read_body(self)
                 fields, files = parse_multipart(body, self.headers.get("Content-Type", ""))
@@ -905,9 +1175,12 @@ class Handler(BaseHTTPRequestHandler):
                 json_response(self, result, status=200 if result.get("returncode") == 0 else 500)
             else:
                 json_response(self, {"error": "not found"}, 404)
+        except (ValueError, KeyError, FileNotFoundError) as exc:
+            traceback.print_exc()
+            json_response(self, {"error": str(exc)}, 400)
         except Exception as exc:
             traceback.print_exc()
-            json_response(self, {"error": str(exc)}, 500)
+            json_response(self, {"error": "Internal server error"}, 500)
 
     def log_message(self, fmt: str, *args) -> None:
         print(f"[demo-ui] {self.address_string()} - {fmt % args}")
@@ -924,6 +1197,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--yolo-python", default=DEFAULT_YOLO_PYTHON)
     parser.add_argument("--medsam-python", default=DEFAULT_MEDSAM_PYTHON)
     parser.add_argument("--classifier-python", default=DEFAULT_CLASSIFIER_PYTHON)
+    parser.add_argument("--classifier-worker-url", default=DEFAULT_CLASSIFIER_WORKER_URL,
+                        help="Optional local classifier worker URL, e.g. http://127.0.0.1:8777.")
     parser.add_argument("--agent-mode", choices=["qwen", "fallback"], default="fallback",
                         help="Chat agent mode: 'qwen' for Qwen3-14B tool agent, 'fallback' for deterministic router.")
     parser.add_argument("--qwen-model-path", default=os.environ.get("YMCA_QWEN_MODEL_PATH"),
@@ -939,6 +1214,7 @@ def main() -> None:
     Handler.ctx = DemoContext(
         args.output_root, args.upload_root, args.guidelines_dir, args.classifier_ckpt,
         args.yolo_python, args.medsam_python, args.classifier_python,
+        classifier_worker_url=args.classifier_worker_url,
         agent_mode=args.agent_mode, qwen_model_path=args.qwen_model_path,
         qwen_load_in_4bit=args.qwen_load_in_4bit,
     )

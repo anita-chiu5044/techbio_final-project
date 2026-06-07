@@ -16,8 +16,11 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -55,12 +58,56 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--logit-adjustment", action="store_true",
                         help="Apply checkpoint class-frequency logit adjustment during classifier inference.")
     parser.add_argument("--python-executable", default=sys.executable)
+    parser.add_argument("--classifier-worker-url", default=os.environ.get("YMCA_CLASSIFIER_WORKER_URL"),
+                        help="Optional local model worker URL, e.g. http://127.0.0.1:8777. Falls back to classifier subprocess when unset.")
     parser.add_argument("--skip-existing", action="store_true", default=True,
                         help="Skip cells that already have model_label set. Default true.")
     return parser.parse_args()
 
 
+def _worker_endpoint(base_url: str, path: str) -> str:
+    return base_url.rstrip("/") + path
+
+
+def run_classifier_via_worker(args: argparse.Namespace, output_json: Path) -> Path:
+    if args.image is None:
+        raise ValueError("--image is required when --classifier-json is not provided")
+    if not args.classifier_worker_url:
+        raise ValueError("classifier_worker_url is not set")
+    payload = {
+        "image": str(args.image),
+        "ckpt": str(args.ckpt),
+        "topk": int(args.topk),
+        "image_size": 224,
+        "logit_adjustment": bool(args.logit_adjustment),
+    }
+    data = json.dumps(payload).encode("utf-8")
+    url = _worker_endpoint(args.classifier_worker_url, "/classify")
+    print(f"$ POST {url}  # classifier worker", flush=True)
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            response = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"classifier worker unavailable at {args.classifier_worker_url}: {exc}") from exc
+    if "error" in response:
+        raise RuntimeError(f"classifier worker error: {response['error']}")
+    records = response.get("records")
+    if not isinstance(records, list):
+        raise RuntimeError("classifier worker response missing records list")
+    output_json.write_text(json.dumps(records, indent=2, ensure_ascii=False))
+    print(f"Saved → {output_json}  ({len(records)} records) via classifier worker", flush=True)
+    return output_json
+
+
 def run_classifier(args: argparse.Namespace, output_json: Path) -> Path:
+    if args.classifier_worker_url:
+        return run_classifier_via_worker(args, output_json)
     if args.image is None:
         raise ValueError("--image is required when --classifier-json is not provided")
     script = REPO_ROOT / "checkpoints_classifier" / "classifier_inference.py"

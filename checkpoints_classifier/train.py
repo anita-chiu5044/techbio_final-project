@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 from pathlib import Path
 
@@ -110,12 +111,34 @@ class DinoBloomClassifier(nn.Module):
         return self.head.parameters()
 
 
+def _dinov2_hub_source() -> tuple[str, str | Path]:
+    """Prefer the local torch hub cache so demo inference never needs GitHub."""
+    candidates = []
+    env_repo = os.environ.get("YMCA_DINOV2_REPO")
+    if env_repo:
+        candidates.append(Path(env_repo))
+    candidates.extend([
+        Path.home() / ".cache" / "torch" / "hub" / "facebookresearch_dinov2_main",
+        Path(__file__).resolve().parents[2] / "artifacts" / "checkpoints" / "dinov2",
+    ])
+    for repo in candidates:
+        if (repo / "hubconf.py").exists():
+            return "local", repo
+    raise FileNotFoundError(
+        "DINOv2 torch hub repo is not available locally. "
+        "Expected hubconf.py under ~/.cache/torch/hub/facebookresearch_dinov2_main "
+        "or set YMCA_DINOV2_REPO to a local dinov2 repo. "
+        "Run once with network to populate torch hub cache before offline demo."
+    )
+
+
 def build_dinobloom(n_classes: int, ckpt_path: Path | None = None,
                     head_type: str = "mlp") -> DinoBloomClassifier:
     """Load DINOv2 ViT-B/14 with DinoBloom pretrained weights + fresh classification head."""
+    source, repo = _dinov2_hub_source()
     backbone = torch.hub.load(
-        "facebookresearch/dinov2", "dinov2_vitb14",
-        pretrained=False, verbose=False, img_size=224,
+        str(repo), "dinov2_vitb14",
+        source=source, pretrained=False, verbose=False, img_size=224,
     )
     resolved = Path(ckpt_path) if ckpt_path else DINOBLOOM_B_CKPT
     if resolved.exists():

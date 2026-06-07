@@ -297,3 +297,94 @@ Next experiments worth doing:
 5. Consider grouping ultra-low-support classes as review-only labels rather than full automatic classes.
 ```
 
+---
+
+## 16-Class Retraining on task_combine — Full YOLO+MedSAM Pipeline
+
+Date: 2026-06-07
+
+### Dataset
+
+Source: `/mnt2/anita/TechBio/classified/PKG - AML-Cytomorphology_LMU/for_fang/task_combine/`
+
+All images processed through full YOLO (top-1 WBC) → MedSAM segmentation pipeline before training.
+
+**Per-class image counts (original → after YOLO+MedSAM):**
+
+| Class | Original | After Pipeline | Loss |
+|---|---:|---:|---:|
+| apl_suspect | 18 | 18 | 0 |
+| artifact | 15 | 14 | -1 |
+| basophil | 79 | 78 | -1 |
+| early_pre_b | 985 | 985 | 0 |
+| eosinophil | 424 | 423 | -1 |
+| erythroid | 78 | 78 | 0 |
+| hematogone | 504 | 504 | 0 |
+| mature_lymphocyte | 3,948 | 3,947 | -1 |
+| monoblast | 26 | 26 | 0 |
+| monocyte | 1,789 | 1,756 | -33 |
+| myeloblast | 42 | 42 | 0 |
+| myelocyte | 3,268 | 3,263 | -5 |
+| neutrophil | 8,593 | 8,524 | -69 |
+| other_immature | 85 | 85 | 0 |
+| pre_b | 963 | 961 | -2 |
+| pro_b | 804 | 793 | -11 |
+| **TOTAL** | **21,621** | **21,497** | **-124 (0.57%)** |
+
+Loss is due to YOLO finding no WBC in 124 images.
+
+Split strategy: test=15% held out, train.py internal val=15% of remainder (effective: train≈72%, val≈13%, test≈15%).
+
+Output root: `/home/yucheng/Desktop/techbio/artifacts/checkpoints/convnet/task_combine_all_configs`
+
+### Config Comparison
+
+| Config | macro_F1 | Balanced Acc | Overall Acc | Notes |
+|---|---:|---:|---:|---|
+| **dinobloom_ce_uniform** | **0.8356** | 0.9389 | 0.9697 | **Best — DinoBloom-B + CrossEntropy, 30 epochs** |
+| ce_uniform | 0.7739 | 0.9279 | 0.9609 | ConvNeXt + CE baseline |
+| focal_wrs | 0.7401 | 0.9185 | 0.9525 | ConvNeXt + Focal + WRS |
+| dinobloom_focal_wrs_stage2 | 0.7049 | 0.9409 | 0.9349 | DinoBloom + two-stage LDAM |
+| dinobloom_focal_wrs | 0.7048 | 0.9294 | 0.9364 | DinoBloom + Focal + WRS |
+
+### Best Config Per-Class: `dinobloom_ce_uniform`
+
+| Class | Precision | Recall | F1 |
+|---|---:|---:|---:|
+| apl_suspect | 0.333 | 1.000 | 0.500 |
+| artifact | 0.500 | 1.000 | 0.667 |
+| basophil | 0.692 | 0.900 | 0.783 |
+| early_pre_b | 0.984 | 0.984 | 0.984 |
+| eosinophil | 0.963 | 0.963 | 0.963 |
+| erythroid | 1.000 | 1.000 | 1.000 |
+| hematogone | 0.954 | 0.969 | 0.961 |
+| mature_lymphocyte | 0.967 | 0.976 | 0.971 |
+| monoblast | 0.500 | 1.000 | 0.667 |
+| monocyte | 0.936 | 0.919 | 0.928 |
+| myeloblast | 0.375 | 0.600 | 0.462 |
+| myelocyte | 0.970 | 0.933 | 0.951 |
+| neutrophil | 0.996 | 0.988 | 0.992 |
+| other_immature | 0.421 | 0.800 | 0.552 |
+| pre_b | 0.992 | 1.000 | 0.996 |
+| pro_b | 1.000 | 0.990 | 0.995 |
+
+### Key Observations
+
+```text
+1. DinoBloom backbone improves macro-F1 significantly (+0.08 over ConvNeXt ce_uniform).
+2. Contrary to expectation, CE outperforms Focal+WRS with DinoBloom — likely because
+   DinoBloom features are already discriminative enough that oversampling destabilises training.
+3. Rare classes (myeloblast, apl_suspect, other_immature) remain weak due to tiny support.
+4. High-support classes (neutrophil, pre_b, pro_b, erythroid) reach F1 ≥ 0.99.
+```
+
+### Active Checkpoint
+
+```text
+/home/yucheng/Desktop/techbio/artifacts/checkpoints/convnet/task_combine_dinobloom/best.pth
+```
+
+Config: `dinobloom_ce_uniform` — macro_F1=0.8356, balanced_acc=0.9389, overall_acc=0.9697
+
+QC policy remains: send apl_suspect, artifact, monoblast, myeloblast, other_immature predictions to human review.
+
