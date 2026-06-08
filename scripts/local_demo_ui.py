@@ -406,6 +406,14 @@ def _handle_chat_fallback(ctx: DemoContext, session_id: str, message: str) -> di
         if cell.get("review_label"):
             answer += f", review_label={cell['review_label']}"
         return _fb(intent, answer, load_case(ctx, session_id), data=cell)
+    if action == "accept_all":
+        result = tools.accept_all_cells(case_id, reviewer_id="demo_clinician")
+        answer = (
+            f"Accepted {result['accepted_count']} cell(s). "
+            f"{result['blocked_count']} kept for manual review (hard-block QC flags). "
+            f"{result['already_reviewed_count']} already reviewed."
+        )
+        return _fb(intent, answer, load_case(ctx, session_id), data=result)
     if action in {"accept", "correct", "exclude", "unclassifiable"}:
         review_payload = {"action": action, "cell_id": intent.get("cell_id"), "label": intent.get("label"), "reviewer_id": "demo_clinician"}
         result = apply_review(ctx, session_id, review_payload)

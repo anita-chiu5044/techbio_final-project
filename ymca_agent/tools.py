@@ -510,6 +510,68 @@ class AgentTools:
             ).fetchone())
         return {"before": before, "after": after}
 
+    # Reasons that indicate genuine model uncertainty — block auto-accept.
+    _HARD_BLOCK_REASONS = frozenset({
+        "small_top1_top2_margin",
+        "low_classifier_probability",
+        "high_entropy",
+        "classifier_not_run",
+        "low_yolo_confidence",
+    })
+
+    def accept_all_cells(
+        self,
+        case_id: str,
+        reviewer_id: str = "auto_accept",
+    ) -> dict[str, Any]:
+        """Accept all cells that are safe to auto-confirm.
+
+        A cell is accepted when its review_reasons contain NONE of the hard-block
+        reasons (model uncertainty: small margin, low probability, high entropy,
+        no classifier output, low YOLO confidence).  Soft reasons (rare class,
+        segmentation quality, bbox overlap) are treated as acceptable and do not
+        block confirmation.
+
+        Cells already reviewed (accepted / corrected / excluded / unclassifiable)
+        are skipped.
+
+        Returns counts of accepted, skipped (hard-block), and already-reviewed cells.
+        """
+        cells = self.list_cells(case_id)
+        accepted: list[str] = []
+        blocked: list[str] = []
+        already_done: list[str] = []
+
+        already_done_statuses = {"accepted_model_label", "corrected", "excluded", "unclassifiable"}
+
+        for cell in cells:
+            status = cell.get("review_status", "")
+            if status in already_done_statuses:
+                already_done.append(cell["cell_id"])
+                continue
+            if cell.get("model_label") is None:
+                blocked.append(cell["cell_id"])
+                continue
+            reasons = set(cell.get("review_reasons") or [])
+            if reasons & self._HARD_BLOCK_REASONS:
+                blocked.append(cell["cell_id"])
+                continue
+            self.update_cell_review(
+                cell["cell_id"],
+                review_status="accepted_model_label",
+                note="bulk accept — no hard-block QC flags",
+                reviewer_id=reviewer_id,
+            )
+            accepted.append(cell["cell_id"])
+
+        return {
+            "accepted": accepted,
+            "accepted_count": len(accepted),
+            "blocked": blocked,
+            "blocked_count": len(blocked),
+            "already_reviewed_count": len(already_done),
+        }
+
     def deactivate_cell(self, cell_id: str, note: str | None = None, reviewer_id: str | None = None) -> dict[str, Any]:
         """Soft-delete a cell by setting is_current=0 and recording a review_event."""
         with connect(self.db_path) as conn:

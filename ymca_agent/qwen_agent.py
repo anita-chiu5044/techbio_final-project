@@ -56,6 +56,17 @@ TOOL_SCHEMAS = [
         "description": "Generate a morphology-review report draft for the current case.",
         "parameters": {},
     },
+    {
+        "name": "accept_all_cells",
+        "description": (
+            "Bulk-accept all cells that are safe to auto-confirm. "
+            "Skips cells with hard-block QC flags: small_top1_top2_margin, "
+            "low_classifier_probability, high_entropy, classifier_not_run, low_yolo_confidence. "
+            "Rare-class, segmentation-quality, and overlap flags are treated as soft and do NOT block. "
+            "Already-reviewed cells are untouched."
+        ),
+        "parameters": {},
+    },
 ]
 
 SYSTEM_PROMPT = """\
@@ -101,6 +112,11 @@ User: Exclude det_000003
 Assistant: TOOL_CALL: {{"tool": "update_cell_review", "args": {{"cell_id": "det_000003", "review_status": "excluded"}}}}
 [tool result arrives]
 Assistant: det_000003 excluded from analysis.
+
+User: Confirm everything / accept all
+Assistant: TOOL_CALL: {{"tool": "accept_all_cells", "args": {{}}}}
+[tool result arrives]
+Assistant: Accepted 12 cells. 3 cells kept for manual review (small_top1_top2_margin or low confidence). 2 cells already reviewed.
 
 User: Is this AML-M0?
 Assistant: M0 (undifferentiated AML) cannot be determined by morphology alone — flow cytometry / immunophenotyping is required to confirm. The morphology classification results are for reference only and do not constitute a final diagnosis.
@@ -200,6 +216,8 @@ def _execute_tool(tools: AgentTools, case_id: str, call: dict[str, Any]) -> Any:
         )
     if name == "generate_case_report":
         return tools.generate_case_report(case_id)
+    if name == "accept_all_cells":
+        return tools.accept_all_cells(case_id, reviewer_id="qwen_agent")
     raise ValueError(f"Unknown tool: {name}")
 
 

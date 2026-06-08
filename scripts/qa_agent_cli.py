@@ -73,6 +73,10 @@ def infer_intent(question: str | None) -> dict[str, str | None]:
         if match:
             return {"action": "correct", "cell_id": match.group(1), "label": match.group(2).upper()}
 
+    # Bulk-accept: "accept all", "confirm all", "confirm everything", etc.
+    if re.search(r"\b(accept|confirm)\s+(all|everything)\b", lower) and not cell_id:
+        return {"action": "accept_all", "cell_id": None, "label": None}
+
     if cell_id and ("接受" in q or "accept" in lower or "同意" in q or "正確" in q):
         return {"action": "accept", "cell_id": cell_id, "label": None}
 
