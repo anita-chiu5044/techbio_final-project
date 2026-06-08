@@ -102,11 +102,6 @@ Assistant: TOOL_CALL: {{"tool": "update_cell_review", "args": {{"cell_id": "det_
 [tool result arrives]
 Assistant: det_000003 excluded from analysis.
 
-User: report
-Assistant: TOOL_CALL: {{"tool": "generate_case_report", "args": {{}}}}
-[tool result arrives — result contains a "content" field with the full report text]
-Assistant: <output the value of result["content"] here, exactly as-is, no changes>
-
 User: Is this AML-M0?
 Assistant: M0 (undifferentiated AML) cannot be determined by morphology alone — flow cytometry / immunophenotyping is required to confirm. The morphology classification results are for reference only and do not constitute a final diagnosis.
 """

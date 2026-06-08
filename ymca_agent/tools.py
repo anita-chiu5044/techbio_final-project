@@ -61,6 +61,13 @@ def _meaningful_guideline_items(items: list[str]) -> list[str]:
     return meaningful
 
 
+def _expand_label(label: str, abbrev_lookup: dict[str, str]) -> str:
+    """Return 'full term (abbrev)' if abbreviation is known, else label as-is."""
+    if label in abbrev_lookup:
+        return f"{abbrev_lookup[label]} ({label})"
+    return label
+
+
 def _fill_report_template(
     case_id: str,
     summary: dict[str, Any],
@@ -68,8 +75,14 @@ def _fill_report_template(
 ) -> str:
     """Fill the English report template with available DB data.
 
-    Fields knowable from the pipeline are filled; clinical fields (specimen type,
-    dates, history, treatment) are left as '—' for the clinician to complete.
+    Uses all English guideline files:
+    - cell_abbreviation_canonical_map: expand label abbreviations to full names
+    - review_triggers + critical_flags: determine urgent review conditions
+    - allowed_phrases: use approved wording in recommendation
+    - qc_review_template: append QC checklist
+    - prohibited_claims: enforced separately by validate_report_safety
+
+    Clinical fields (specimen type, dates, history) are left '—' for the clinician.
     """
     template_body = (
         "I. Specimen Information\n- Specimen type:\n- Collection date/time:\n- Received date/time:\n- Examination:\n\n"
@@ -79,7 +92,6 @@ def _fill_report_template(
         "V. Conclusion/Opinion\n- Conclusion:\n- Recommendation:\n- Urgent review or notification required:"
     )
 
-    # Build per-field fill values from summary
     hard_counts: dict[str, int] = summary.get("hard_counts", {})
     disease_warnings: list[str] = summary.get("disease_warnings", [])
     total_cells: int = summary.get("total_cells", 0)
@@ -89,13 +101,21 @@ def _fill_report_template(
     unclassifiable: int = summary.get("unclassifiable_count", 0)
     blast_like_ratio: float = summary.get("blast_like_ratio") or 0.0
 
+    # cell_abbreviation_canonical_map: expand abbreviations to full names
+    abbrev = getattr(guidelines, "abbreviation_lookup", {})
+
     # III: bone marrow smear findings — cell distribution table
     if hard_counts:
         count_lines = ["(Morphology screening result — not a complete differential count)"]
         for label, n in sorted(hard_counts.items(), key=lambda x: -x[1]):
             pct = 100 * n / hard_total if hard_total else 0
-            count_lines.append(f"  {label}: {n} ({pct:.1f}%)")
-        count_lines.append(f"  Total cells: {total_cells} (confirmed: {hard_total}, pending review: {review_needed}, excluded: {excluded}, unclassifiable: {unclassifiable})")
+            display = _expand_label(label, abbrev)
+            count_lines.append(f"  {display}: {n} ({pct:.1f}%)")
+        count_lines.append(
+            f"  Total cells: {total_cells} "
+            f"(confirmed: {hard_total}, pending review: {review_needed}, "
+            f"excluded: {excluded}, unclassifiable: {unclassifiable})"
+        )
         bone_marrow_val = "\n".join(count_lines)
     else:
         bone_marrow_val = "No confirmed cell labels available"
@@ -105,35 +125,70 @@ def _fill_report_template(
         main_finding = "; ".join(disease_warnings)
     elif hard_counts:
         top = sorted(hard_counts.items(), key=lambda x: -x[1])[:3]
-        main_finding = "Predominant cell types: " + ", ".join(f"{l} ({n})" for l, n in top)
+        main_finding = "Predominant cell types: " + ", ".join(
+            f"{_expand_label(l, abbrev)} ({n})" for l, n in top
+        )
     else:
         main_finding = "—"
 
     # IV: items to exclude or confirm
     if review_needed > 0:
-        exclude_note = f"{review_needed} cell(s) still pending manual review; recommend human confirmation before issuing final report"
+        exclude_note = (
+            f"{review_needed} cell(s) still pending manual review; "
+            "recommend human confirmation before issuing final report"
+        )
     else:
         exclude_note = "All cells have completed initial screening; recommend correlation with other clinical tests"
 
     # V: conclusion
     if blast_like_ratio > 0:
-        conclusion = f"Morphology screening indicates suspected blast-like cell ratio ~{blast_like_ratio*100:.1f}%; recommend clinical review. (Research draft — not for clinical diagnosis)"
+        conclusion = (
+            f"Morphology screening indicates suspected blast-like cell ratio "
+            f"~{blast_like_ratio*100:.1f}%; recommend clinical review. "
+            "(Research draft — not for clinical diagnosis)"
+        )
     else:
-        conclusion = "Morphology screening complete; no significant blast-like proportion detected. (Research draft — not for clinical diagnosis)"
+        conclusion = (
+            "Morphology screening complete; no significant blast-like proportion detected. "
+            "(Research draft — not for clinical diagnosis)"
+        )
 
-    # V: recommendation
-    recommendation = "Recommend correlation with CBC, flow cytometry, and molecular/cytogenetic testing; if morphology is abnormal, refer to a hematopathologist for review"
+    # V: recommendation — use approved phrases if available
+    approved = getattr(guidelines, "approved_phrases", [])
+    if approved:
+        recommendation = approved[0]
+    else:
+        recommendation = (
+            "Recommend correlation with CBC, flow cytometry, and molecular/cytogenetic testing; "
+            "if morphology is abnormal, refer to a hematopathologist for review"
+        )
 
-    # V: urgent review
-    critical = _meaningful_guideline_items(guidelines.critical_flags)
-    if disease_warnings or blast_like_ratio > 0.2:
-        urgent = "Yes — suspected high-risk morphology detected; recommend urgent review"
-    elif critical:
-        urgent = f"Depends on clinical context — see: {critical[0]}"
+    # V: urgent review — check review_triggers + critical_flags + disease_warnings
+    trigger_items: list[dict] = getattr(guidelines, "review_trigger_items", [])
+    critical_items: list[dict] = getattr(guidelines, "critical_flag_items", [])
+    all_trigger_items = trigger_items + critical_items
+
+    triggered: list[str] = []
+    # Check each trigger's trigger_terms against hard_counts keys and disease_warnings
+    for item in all_trigger_items:
+        terms: list[str] = item.get("trigger_terms") or []
+        label_str = item.get("label") or item.get("id") or ""
+        wording = item.get("approved_wording") or ""
+        for term in terms:
+            term_l = term.lower()
+            if any(term_l in k.lower() for k in hard_counts) or \
+               any(term_l in w.lower() for w in disease_warnings):
+                triggered.append(wording or label_str)
+                break
+    # Also trigger on disease_warnings or high blast ratio
+    if disease_warnings or blast_like_ratio > 0.2 or triggered:
+        all_reasons = triggered + disease_warnings
+        urgent = "Yes — " + ("; ".join(all_reasons) if all_reasons else "high-risk morphology detected") + "; recommend urgent review"
+    elif any(item.get("severity") == "urgent" for item in all_trigger_items):
+        urgent = "Depends on clinical context — review against applicable trigger criteria"
     else:
         urgent = "No — no significant urgent flags in current screening"
 
-    # Field substitution map: field prefix (after "- ") → value
     fill_map = {
         "Examination:": f"Case ID: {case_id}",
         "Bone marrow smear/biopsy findings:": bone_marrow_val,
@@ -151,7 +206,6 @@ def _fill_report_template(
         for prefix, value in fill_map.items():
             if stripped.startswith(prefix):
                 indent = "- " if line.lstrip().startswith("-") else ""
-                # Multi-line values: indent continuation lines
                 value_lines = value.splitlines()
                 out_lines.append(f"{indent}{prefix} {value_lines[0]}")
                 for vl in value_lines[1:]:
@@ -159,14 +213,24 @@ def _fill_report_template(
                 matched = True
                 break
         if not matched:
-            # Leave blank fields as "—"
             if (line.endswith(":") or line.endswith("：")) and "- " in line:
                 out_lines.append(line + " —")
             else:
                 out_lines.append(line)
 
+    # QC checklist from qc_review_template
+    qc_text = getattr(guidelines, "qc_review_template", "")
+    qc_section = ""
+    if qc_text:
+        checklist_lines = [
+            l.strip() for l in qc_text.splitlines()
+            if l.strip().startswith("- [")
+        ]
+        if checklist_lines:
+            qc_section = "\n\nVI. QC Checklist (reviewer to complete)\n" + "\n".join(checklist_lines)
+
     header = "[Research draft — not for clinical diagnosis]\n"
-    return header + "\n".join(out_lines)
+    return header + "\n".join(out_lines) + qc_section
 
 
 def _row_to_cell(row: Any) -> dict[str, Any]:
