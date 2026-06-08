@@ -217,18 +217,31 @@ def load_case(ctx: DemoContext, session_id: str) -> dict:
     summary = tools.summarize_case(case_id)
     cells = tools.list_cells(case_id)
     session_input_dir = ctx.session_dir(session_id) / "input_images"
+    # Build a canonical per-filename map from session_input_dir so all cells
+    # that reference the same source image end up with the same roi_image_path.
+    # Without this, cells from different upload runs get different absolute paths
+    # (run_<ts>/image.jpg vs input_images/image.jpg) and the JS filter treats them
+    # as coming from different images, hiding bboxes for the "other" cells.
+    canonical_by_name: dict[str, Path] = {}
+    if session_input_dir.exists():
+        for f in session_input_dir.iterdir():
+            if f.is_file():
+                canonical_by_name[f.name] = f.resolve()
+    fallback_image = first_image_in_dir(session_input_dir)
+
     for cell in cells:
         for key in ("clean_patch_path", "mask_path"):
             value = cell.get(key)
             if value and not Path(value).exists():
                 cell[key] = None
-        # Ensure roi_image_path is a real image file (not a directory, not missing).
-        # Fall back to any image in session_input_dir so the canvas always works.
+        # Normalize roi_image_path: prefer the session_input_dir copy so all
+        # cells from the same source image share a single canonical path.
         roi = cell.get("roi_image_path")
         roi_path = Path(roi) if roi else None
-        if not roi_path or not roi_path.is_file():
-            fallback = first_image_in_dir(session_input_dir)
-            cell["roi_image_path"] = str(fallback.resolve()) if fallback else None
+        if roi_path and roi_path.is_file() and roi_path.name in canonical_by_name:
+            cell["roi_image_path"] = str(canonical_by_name[roi_path.name])
+        elif not roi_path or not roi_path.is_file():
+            cell["roi_image_path"] = str(fallback_image.resolve()) if fallback_image else None
     report = tools.generate_case_report(case_id)
     # Get original image path from cases table (session-level fallback).
     with sqlite3.connect(db) as conn:
@@ -360,11 +373,11 @@ def _handle_chat_fallback(ctx: DemoContext, session_id: str, message: str) -> di
         return _fb(intent, answer, load_case(ctx, session_id), data=summary)
     if action == "report":
         report = tools.generate_case_report(case_id)
-        return _fb(intent, "已重新產生 morphology-review report。", load_case(ctx, session_id), data=report["content"])
+        return _fb(intent, "Morphology-review report regenerated.", load_case(ctx, session_id), data=report["content"])
     if action == "uncertain":
         cells = tools.list_uncertain_cells(case_id)
         if cells:
-            lines = [f"找到 {len(cells)} 顆需要複核的細胞:"]
+            lines = [f"Found {len(cells)} cell(s) needing review:"]
             for c in cells[:5]:
                 reasons = ", ".join(c.get("review_reasons", []))
                 lines.append(f"  {c['cell_id']}: {c.get('model_label','?')} ({(c.get('top_probability',0)*100):.0f}%) — {reasons}")
@@ -372,11 +385,11 @@ def _handle_chat_fallback(ctx: DemoContext, session_id: str, message: str) -> di
                 lines.append(f"  ... and {len(cells)-5} more")
             answer = "\n".join(lines)
         else:
-            answer = "目前沒有需要複核的細胞。"
+            answer = "No cells currently require review."
         return _fb(intent, answer, load_case(ctx, session_id), data=cells)
     if action == "cells":
         cells = tools.list_cells(case_id)
-        answer = f"目前 case 有 {len(cells)} 顆 cell。"
+        answer = f"Case contains {len(cells)} cell(s)."
         if cells:
             by_label = {}
             for c in cells:
@@ -387,7 +400,7 @@ def _handle_chat_fallback(ctx: DemoContext, session_id: str, message: str) -> di
     if action == "cell":
         cell_id = intent.get("cell_id")
         if not cell_id:
-            raise ValueError("請指定 cell id")
+            raise ValueError("Please specify a cell id")
         cell = tools.get_cell(cell_id)
         answer = f"{cell_id}: model={cell.get('model_label','?')} ({(cell.get('top_probability',0)*100):.1f}%), status={cell.get('review_status','?')}"
         if cell.get("review_label"):
@@ -396,8 +409,8 @@ def _handle_chat_fallback(ctx: DemoContext, session_id: str, message: str) -> di
     if action in {"accept", "correct", "exclude", "unclassifiable"}:
         review_payload = {"action": action, "cell_id": intent.get("cell_id"), "label": intent.get("label"), "reviewer_id": "demo_clinician"}
         result = apply_review(ctx, session_id, review_payload)
-        return {**_fb(intent, "已依照你的指示更新人工複核結果。", result.get("case", load_case(ctx, session_id))), **result}
-    return _fb(intent, "我目前只能處理 summary/report/uncertain/cell/review 指令。", load_case(ctx, session_id))
+        return {**_fb(intent, "Review updated as requested.", result.get("case", load_case(ctx, session_id))), **result}
+    return _fb(intent, "I can only handle summary / report / uncertain / cell / review commands.", load_case(ctx, session_id))
 
 
 def handle_chat(ctx: DemoContext, session_id: str, message: str) -> dict:
@@ -633,7 +646,7 @@ pre{white-space:pre-wrap;word-break:break-word;background:#f8fafc;padding:8px;bo
   <div class='col-hdr'>Chat Assistant</div>
   <div style='flex:1;display:flex;flex-direction:column;padding:0 12px 12px;gap:6px;min-height:0'>
     <div id='chatlog' class='chatlog'></div>
-    <textarea id='chatInput' rows='2' placeholder='summary / 哪些細胞最不確定？ / 把 det_000001 改成 LYT / report'></textarea>
+    <textarea id='chatInput' rows='2' placeholder='summary / which cells are uncertain? / correct det_000001 to LYT / report'></textarea>
     <div class='row'><button class='primary' onclick='sendChat()' style='flex:1'>Send</button><button onclick='document.getElementById("chatlog").innerHTML=""'>Clear</button></div>
   </div>
 </div>
@@ -684,14 +697,14 @@ pre{white-space:pre-wrap;word-break:break-word;background:#f8fafc;padding:8px;bo
 <table>
 <tr><th>Command</th><th>Example</th><th>Action</th></tr>
 <tr><td>Summary</td><td><code>summary</code></td><td>Show case summary with cell counts and disease warnings</td></tr>
-<tr><td>Uncertain cells</td><td><code>哪些細胞最不確定？</code></td><td>List cells needing review, sorted by uncertainty</td></tr>
-<tr><td>Inspect cell</td><td><code>看 det_000006</code></td><td>Show details for a specific cell</td></tr>
-<tr><td>Accept</td><td><code>接受 det_000006</code></td><td>Accept the model's label for a cell</td></tr>
-<tr><td>Correct</td><td><code>把 det_000006 改成 LYT</code></td><td>Correct a cell's label (model label preserved)</td></tr>
-<tr><td>Exclude</td><td><code>det_000003 不要用</code></td><td>Exclude a cell from analysis</td></tr>
-<tr><td>Unclassifiable</td><td><code>det_000004 無法分類</code></td><td>Mark as unclassifiable</td></tr>
-<tr><td>Report</td><td><code>report</code> / <code>產生報告</code></td><td>Generate morphology-review report</td></tr>
-<tr><td>List cells</td><td><code>list cells</code> / <code>細胞</code></td><td>List all cells in the case</td></tr>
+<tr><td>Uncertain cells</td><td><code>which cells are uncertain?</code></td><td>List cells needing review, sorted by uncertainty</td></tr>
+<tr><td>Inspect cell</td><td><code>show det_000006</code></td><td>Show details for a specific cell</td></tr>
+<tr><td>Accept</td><td><code>accept det_000006</code></td><td>Accept the model's label for a cell</td></tr>
+<tr><td>Correct</td><td><code>correct det_000006 to LYT</code></td><td>Correct a cell's label (model label preserved)</td></tr>
+<tr><td>Exclude</td><td><code>exclude det_000003</code></td><td>Exclude a cell from analysis</td></tr>
+<tr><td>Unclassifiable</td><td><code>det_000004 unclassifiable</code></td><td>Mark as unclassifiable</td></tr>
+<tr><td>Report</td><td><code>report</code></td><td>Generate morphology-review report</td></tr>
+<tr><td>List cells</td><td><code>list cells</code></td><td>List all cells in the case</td></tr>
 </table>
 
 <h2>Cell Types (15 Classes)</h2>
@@ -781,7 +794,7 @@ function cellNeedsReview(c){return c.review_status==='queued_for_review'||c.revi
 function cellIsClosed(c){return c.review_status==='excluded'||c.review_status==='unclassifiable'}
 function renderCellCard(c){const act=currentCell&&currentCell.cell_id===c.cell_id?' active':'';const reasons=(c.review_reasons||[]).map(r=>`<span class="chip warn">${esc(r)}</span>`).join('');const prob=c.top_probability!=null?(c.top_probability*100).toFixed(1)+'%':'';const isGated=!c.downstream_eligible&&c.review_status==='queued_for_review';const st=isGated?'<span class="chip warn">YOLO gated</span>':c.review_status==='accepted_model_label'?'<span class="chip ok">accepted</span>':c.review_status==='corrected'?`<span class="chip info">&rarr;${esc(c.review_label)}</span>`:c.review_status==='excluded'?'<span class="chip" style="color:var(--bad)">excluded</span>':c.review_status==='unclassifiable'?'<span class="chip warn">unclassifiable</span>':'';const yoloConf=c.yolo_confidence!=null?` YOLO:${(c.yolo_confidence*100).toFixed(0)}%`:'';const thumbSrc=c.clean_patch_path||c.mask_path;return`<div class="cell-card${act}" onclick="selectCell('${esc(c.cell_id)}')">${thumbSrc?`<img class="thumb" src="${fileUrl(thumbSrc)}"/>`:`<div class="thumb" style="display:flex;align-items:center;justify-content:center;font-size:10px;color:var(--muted)">manual</div>`}<div><div style="font-weight:600;font-size:12px">${esc(c.review_label||c.model_label||'pending')} <span class="muted">${prob}${yoloConf}</span></div><div class="muted" style="font-size:11px">${esc(c.cell_id)}</div><div style="margin-top:2px">${st}${reasons}</div></div></div>`}
 function renderCellSection(title,cells,open=true){const body=cells.length?cells.map(renderCellCard).join(''):`<div class="cell-folder-empty">No cells</div>`;return`<details class="cell-section" ${open?'open':''}><summary>${esc(title)} <span>${cells.length}</span></summary>${body}</details>`}
-function renderCells(){const box=document.getElementById('cells');const cells=currentCase.cells||[];const uncertain=cells.filter(c=>!cellIsClosed(c)&&cellNeedsReview(c));const closed=cells.filter(cellIsClosed);const confirmed=cells.filter(c=>!cellIsClosed(c)&&!cellNeedsReview(c));box.innerHTML=renderCellSection('Needs Review / 不確定',uncertain,true)+renderCellSection('Confirmed / 確定可用',confirmed,true)+renderCellSection('Excluded / 不納入',closed,false)}
+function renderCells(){const box=document.getElementById('cells');const cells=currentCase.cells||[];const uncertain=cells.filter(c=>!cellIsClosed(c)&&cellNeedsReview(c));const closed=cells.filter(cellIsClosed);const confirmed=cells.filter(c=>!cellIsClosed(c)&&!cellNeedsReview(c));box.innerHTML=renderCellSection('Needs Review',uncertain,true)+renderCellSection('Confirmed',confirmed,true)+renderCellSection('Excluded',closed,false)}
 
 function renderReport(){document.getElementById('report').textContent=currentCase.report||''}
 

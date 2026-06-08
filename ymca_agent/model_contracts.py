@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
 YOLO_CLASSES = {"RBC", "WBC", "Platelets"}
@@ -74,6 +75,14 @@ def validate_yolo_detection(record: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _abs_path(p: str | None) -> str | None:
+    """Resolve a path to absolute if it exists, else return as-is (or None)."""
+    if not p:
+        return None
+    resolved = Path(p).resolve()
+    return str(resolved)
+
+
 def yolo_detection_to_cell_fields(record: Mapping[str, Any]) -> dict[str, Any]:
     detection = validate_yolo_detection(record)
     return {
@@ -83,7 +92,8 @@ def yolo_detection_to_cell_fields(record: Mapping[str, Any]) -> dict[str, Any]:
         "yolo_class_name": detection["class_label"],
         "downstream_eligible": 1 if detection["downstream_eligible"] else 0,
         "yolo_confidence": detection["confidence"],
-        "clean_patch_path": detection["patch_path"],
+        "clean_patch_path": _abs_path(detection["patch_path"]),
+        "roi_image_path": _abs_path(detection["source_image_path"]),
     }
 
 
@@ -137,7 +147,7 @@ def classifier_result_to_cell_fields(
     probability_margin = None if top2_probability is None else round(result["top1_prob"] - top2_probability, 6)
     probabilities = {pred["class"]: pred["probability"] for pred in predictions}
     return {
-        "clean_patch_path": result["image"],
+        "clean_patch_path": _abs_path(result["image"]),
         "model_label": result["top1_class"],
         "top_probability": result["top1_prob"],
         "top2_label": None if top2 is None else top2["class"],
@@ -167,7 +177,11 @@ def validate_medsam_summary_record(record: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("mask_path is required when status is OK")
     if status == "OK" and num_detections <= 0:
         raise ValueError("num_detections must be positive when status is OK")
-    if status != "OK":
+    # For SKIPPED, keep mask_path if it points to an existing file (pre-existing mask).
+    # For all other non-OK statuses, clear it.
+    if status not in {"OK", "SKIPPED"}:
+        mask_path = ""
+    elif status == "SKIPPED" and mask_path and not Path(mask_path).exists():
         mask_path = ""
     return {
         "image": image,
@@ -199,9 +213,10 @@ def medsam_summary_to_cell_fields(
     else:
         segmentation_status = "failed"
         segmentation_quality = 0.0
+    abs_mask = _abs_path(result["mask_path"]) if result["mask_path"] else None
     return {
-        "mask_path": result["mask_path"] or None,
-        "clean_patch_path": result["mask_path"] or None,
+        "mask_path": abs_mask,
+        "clean_patch_path": abs_mask,
         "segmentation_status": segmentation_status,
         "segmentation_quality": segmentation_quality,
         "preprocess_version": preprocess_version,

@@ -6,13 +6,12 @@ import math
 from collections.abc import Mapping
 
 RARE_CLASSES = frozenset({
-    "PMB", "MYB", "MOB", "MMZ", "KSC", "PMO",
-    "apl_suspect", "other_immature", "Immature",
+    "monoblast", "myeloblast", "apl_suspect", "other_immature",
+    "early_pre_b", "pre_b", "pro_b", "hematogone",
 })
 
 BLAST_LIKE_LABELS = frozenset({
-    "PMB", "MYB", "MOB", "MMZ", "PMO",
-    "apl_suspect", "other_immature", "Immature",
+    "monoblast", "myeloblast", "apl_suspect", "other_immature",
 })
 
 

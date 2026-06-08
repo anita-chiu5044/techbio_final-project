@@ -86,18 +86,18 @@ After receiving the tool result, you may call another tool or give your final an
 Maximum {max_calls} tool calls per turn. After the last tool call, you MUST give a final text answer.
 
 ## Examples
-User: 哪些細胞最不確定？
+User: Which cells are uncertain?
 Assistant: TOOL_CALL: {{"tool": "list_uncertain_cells", "args": {{"limit": 5}}}}
 [tool result arrives]
-Assistant: 目前有 2 顆需要複核的細胞：det_000006 (low_yolo_confidence) 和 det_000008 (rare_or_immature_class)。建議優先檢視這兩顆。
+Assistant: There are 2 cells requiring review: det_000006 (low_yolo_confidence) and det_000008 (rare_or_immature_class). Recommend reviewing these first.
 
-User: 把 det_000006 改成 LYT
+User: Correct det_000006 to LYT
 Assistant: TOOL_CALL: {{"tool": "update_cell_review", "args": {{"cell_id": "det_000006", "review_status": "corrected", "review_label": "LYT"}}}}
 [tool result arrives]
-Assistant: 已將 det_000006 的 review_label 更正為 LYT。原始 model_label (NGS) 保留不變。
+Assistant: det_000006 review_label corrected to LYT. Original model_label (NGS) is preserved.
 
-User: 這是不是 AML-M0？
-Assistant: M0 (undifferentiated AML) 無法僅靠形態學判定，需要 flow cytometry / immunophenotyping 才能確認。目前的形態學分類結果僅供參考，不構成最終診斷。
+User: Is this AML-M0?
+Assistant: M0 (undifferentiated AML) cannot be determined by morphology alone — flow cytometry / immunophenotyping is required to confirm. The morphology classification results are for reference only and do not constitute a final diagnosis.
 """
 
 

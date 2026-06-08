@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS cells (
 );
 
 CREATE INDEX IF NOT EXISTS idx_cells_case ON cells(case_id);
+CREATE INDEX IF NOT EXISTS idx_cells_case_current ON cells(case_id, is_current);
 CREATE INDEX IF NOT EXISTS idx_cells_label ON cells(model_label);
 CREATE INDEX IF NOT EXISTS idx_cells_review_status ON cells(review_status);
 
@@ -112,6 +113,8 @@ def connect(db_path: str | Path = "ymca_agent.db") -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 5000")
     return conn
 
 
@@ -134,3 +137,4 @@ def _migrate_existing_schema(conn: sqlite3.Connection) -> None:
         if column not in columns:
             conn.execute(statement)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_cells_yolo_class ON cells(yolo_class_name)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_cells_case_current ON cells(case_id, is_current)")

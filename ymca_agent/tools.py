@@ -15,11 +15,11 @@ from .qc import BLAST_LIKE_LABELS, RARE_CLASSES, review_reasons, uncertainty_sco
 from .storage import connect, init_db
 
 # Canonical labels accepted for review_label validation.
-# Matches the 15-class flat classifier label set.
+# Matches the 16-class task_combine classifier label set.
 CANONICAL_LABELS = frozenset({
-    "NGS", "NGB", "LYT", "LYA", "MON", "EOS", "BAS", "EBO",
-    "MYO", "MMZ", "MYB", "PMO", "PMB", "MOB", "KSC",
-    "apl_suspect", "other_immature", "Immature",
+    "apl_suspect", "artifact", "basophil", "early_pre_b", "eosinophil",
+    "erythroid", "hematogone", "mature_lymphocyte", "monoblast", "monocyte",
+    "myeloblast", "myelocyte", "neutrophil", "other_immature", "pre_b", "pro_b",
 })
 
 REVIEW_BLOCKING_STATUSES = {"queued_for_review", "needs_senior_review", "unclassifiable", "excluded"}
@@ -59,6 +59,123 @@ def _meaningful_guideline_items(items: list[str]) -> list[str]:
             continue
         meaningful.append(stripped)
     return meaningful
+
+
+def _fill_zh_template(
+    case_id: str,
+    summary: dict[str, Any],
+    guidelines: Any,
+    guidelines_dir: Path,
+) -> str:
+    """Fill the Chinese report template with available DB data.
+
+    Fields knowable from the pipeline are filled; clinical fields (specimen type,
+    dates, history, treatment) are left as '—' for the clinician to complete.
+    """
+    template_path = guidelines_dir / "report_template_zh.md"
+    if template_path.exists():
+        raw = template_path.read_text()
+        # Extract text inside the first ```text ... ``` block
+        import re as _re
+        m = _re.search(r"```text\s*(.*?)```", raw, _re.DOTALL)
+        template_body = m.group(1).strip() if m else raw
+    else:
+        template_body = (
+            "I. Specimen Information\n- Specimen type:\n- Collection date/time:\n- Received date/time:\n- Examination:\n\n"
+            "II. Clinical Data\n- Clinical diagnosis/question:\n- Relevant history:\n- Recent treatment or tests:\n\n"
+            "III. Findings\n- Peripheral blood morphology:\n- Bone marrow smear/biopsy findings:\n- Special stains / flow cytometry / molecular or cytogenetics:\n\n"
+            "IV. Interpretation\n- Main morphological findings:\n- Relevance to clinical question:\n- Items to exclude or confirm:\n\n"
+            "V. Conclusion/Opinion\n- Conclusion:\n- Recommendation:\n- Urgent review or notification required:"
+        )
+
+    # Build per-field fill values from summary
+    hard_counts: dict[str, int] = summary.get("hard_counts", {})
+    disease_warnings: list[str] = summary.get("disease_warnings", [])
+    total_cells: int = summary.get("total_cells", 0)
+    hard_total: int = summary.get("hard_count_total", 0)
+    review_needed: int = summary.get("review_needed_count", 0)
+    excluded: int = summary.get("excluded_count", 0)
+    unclassifiable: int = summary.get("unclassifiable_count", 0)
+    blast_like_ratio: float = summary.get("blast_like_ratio") or 0.0
+
+    # III: bone marrow smear findings — cell distribution table
+    if hard_counts:
+        count_lines = ["(Morphology screening result — not a complete differential count)"]
+        for label, n in sorted(hard_counts.items(), key=lambda x: -x[1]):
+            pct = 100 * n / hard_total if hard_total else 0
+            count_lines.append(f"  {label}: {n} ({pct:.1f}%)")
+        count_lines.append(f"  Total cells: {total_cells} (confirmed: {hard_total}, pending review: {review_needed}, excluded: {excluded}, unclassifiable: {unclassifiable})")
+        bone_marrow_val = "\n".join(count_lines)
+    else:
+        bone_marrow_val = "No confirmed cell labels available"
+
+    # IV: main morphological findings
+    if disease_warnings:
+        main_finding = "; ".join(disease_warnings)
+    elif hard_counts:
+        top = sorted(hard_counts.items(), key=lambda x: -x[1])[:3]
+        main_finding = "Predominant cell types: " + ", ".join(f"{l} ({n})" for l, n in top)
+    else:
+        main_finding = "—"
+
+    # IV: items to exclude or confirm
+    if review_needed > 0:
+        exclude_note = f"{review_needed} cell(s) still pending manual review; recommend human confirmation before issuing final report"
+    else:
+        exclude_note = "All cells have completed initial screening; recommend correlation with other clinical tests"
+
+    # V: conclusion
+    if blast_like_ratio > 0:
+        conclusion = f"Morphology screening indicates suspected blast-like cell ratio ~{blast_like_ratio*100:.1f}%; recommend clinical review. (Research draft — not for clinical diagnosis)"
+    else:
+        conclusion = "Morphology screening complete; no significant blast-like proportion detected. (Research draft — not for clinical diagnosis)"
+
+    # V: recommendation
+    recommendation = "Recommend correlation with CBC, flow cytometry, and molecular/cytogenetic testing; if morphology is abnormal, refer to a hematopathologist for review"
+
+    # V: urgent review
+    critical = _meaningful_guideline_items(guidelines.critical_flags)
+    if disease_warnings or blast_like_ratio > 0.2:
+        urgent = "Yes — suspected high-risk morphology detected; recommend urgent review"
+    elif critical:
+        urgent = f"Depends on clinical context — see: {critical[0]}"
+    else:
+        urgent = "No — no significant urgent flags in current screening"
+
+    # Field substitution map: field prefix (after "- ") → value
+    fill_map = {
+        "Examination:": f"Case ID: {case_id}",
+        "Bone marrow smear/biopsy findings:": bone_marrow_val,
+        "Main morphological findings:": main_finding,
+        "Items to exclude or confirm:": exclude_note,
+        "Conclusion:": conclusion,
+        "Recommendation:": recommendation,
+        "Urgent review or notification required:": urgent,
+    }
+
+    out_lines: list[str] = []
+    for line in template_body.splitlines():
+        stripped = line.lstrip("- ").strip()
+        matched = False
+        for prefix, value in fill_map.items():
+            if stripped.startswith(prefix):
+                indent = "- " if line.lstrip().startswith("-") else ""
+                # Multi-line values: indent continuation lines
+                value_lines = value.splitlines()
+                out_lines.append(f"{indent}{prefix}{value_lines[0]}")
+                for vl in value_lines[1:]:
+                    out_lines.append(f"    {vl}")
+                matched = True
+                break
+        if not matched:
+            # Leave blank fields as "—"
+            if (line.endswith(":") or line.endswith("：")) and "- " in line:
+                out_lines.append(line + " —")
+            else:
+                out_lines.append(line)
+
+    header = "[Research draft — not for clinical diagnosis]\n"
+    return header + "\n".join(out_lines)
 
 
 def _row_to_cell(row: Any) -> dict[str, Any]:
@@ -307,12 +424,17 @@ class AgentTools:
             raise ValueError(f"unknown review_label: {review_label!r}; must be one of {sorted(CANONICAL_LABELS)}")
         if review_status == "accepted_model_label" and review_label is not None:
             raise ValueError("review_label should be None when accepting the model label")
-        before = self.get_cell(cell_id)
-        if review_status == "accepted_model_label" and before.get("model_label") is None:
-            raise ValueError(
-                f"cannot accept model label for cell {cell_id}: model_label is not set"
-            )
         with connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT * FROM cells WHERE cell_id = ? AND is_current = 1", (cell_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"cell not found: {cell_id}")
+            before = dict(row)
+            if review_status == "accepted_model_label" and before.get("model_label") is None:
+                raise ValueError(
+                    f"cannot accept model label for cell {cell_id}: model_label is not set"
+                )
             conn.execute(
                 """
                 UPDATE cells
@@ -328,13 +450,20 @@ class AgentTools:
                 """,
                 (cell_id, before["review_status"], before["review_label"], review_status, review_label, note, reviewer_id),
             )
-        after = self.get_cell(cell_id)
+            after = dict(conn.execute(
+                "SELECT * FROM cells WHERE cell_id = ?", (cell_id,)
+            ).fetchone())
         return {"before": before, "after": after}
 
     def deactivate_cell(self, cell_id: str, note: str | None = None, reviewer_id: str | None = None) -> dict[str, Any]:
         """Soft-delete a cell by setting is_current=0 and recording a review_event."""
-        before = self.get_cell(cell_id)
         with connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT * FROM cells WHERE cell_id = ? AND is_current = 1", (cell_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"cell not found: {cell_id}")
+            before = dict(row)
             conn.execute(
                 "UPDATE cells SET is_current = 0, updated_at = CURRENT_TIMESTAMP WHERE cell_id = ?",
                 (cell_id,),
@@ -344,7 +473,7 @@ class AgentTools:
                 INSERT INTO review_events (cell_id, previous_review_status, previous_review_label, new_review_status, new_review_label, note, reviewer_id)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (cell_id, before["review_status"], before["review_label"], "deactivated", None, note, reviewer_id),
+                (cell_id, before["review_status"], before["review_label"], before["review_status"], None, note, reviewer_id),
             )
         return {"cell_id": cell_id, "is_current": 0, "previous_review_status": before["review_status"]}
 
@@ -365,9 +494,9 @@ class AgentTools:
                 INSERT INTO cells (
                     cell_id, case_id, detection_id, bbox_xyxy_original,
                     yolo_class_id, yolo_class_name, downstream_eligible,
-                    yolo_confidence, clean_patch_path
+                    yolo_confidence, clean_patch_path, roi_image_path
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(cell_id) DO UPDATE SET
                     detection_id = excluded.detection_id,
                     bbox_xyxy_original = excluded.bbox_xyxy_original,
@@ -376,6 +505,8 @@ class AgentTools:
                     downstream_eligible = excluded.downstream_eligible,
                     yolo_confidence = excluded.yolo_confidence,
                     clean_patch_path = excluded.clean_patch_path,
+                    roi_image_path = excluded.roi_image_path,
+                    is_current = 1,
                     updated_at = CURRENT_TIMESTAMP
                 """,
                 (
@@ -388,6 +519,7 @@ class AgentTools:
                     fields["downstream_eligible"],
                     fields["yolo_confidence"],
                     fields["clean_patch_path"],
+                    fields["roi_image_path"],
                 ),
             )
         return self.get_cell(resolved_cell_id)
@@ -531,31 +663,7 @@ class AgentTools:
     def generate_case_report(self, case_id: str) -> dict[str, Any]:
         summary = self.summarize_case(case_id)
         guidelines = load_reporting_guidelines(self.guidelines_dir)
-        lines = [
-            "Research draft report - not for clinical diagnosis.",
-            f"Case: {case_id}",
-            "Session type: morphology-review session over submitted cell images/ROIs.",
-            f"Submitted evidence items: {summary['total_cells']}",
-            f"Review-ready cells: {summary['hard_count_total']}",
-            f"Review-needed cells: {summary['review_needed_count']}",
-            f"Excluded cells: {summary['excluded_count']}",
-            f"Unclassifiable cells: {summary['unclassifiable_count']}",
-            f"Accepted morphology labels: {summary['hard_counts']}",
-            "Interpretation: morphology-level screening summary only; confirmatory review/testing is required for clinical decisions.",
-            "Boundary: this MVP does not report complete WBC differential, true blast percentage, or AML diagnostic thresholds.",
-        ]
-        if guidelines.allowed_phrases:
-            lines.append(f"Allowed wording reference: {guidelines.allowed_phrases[0]}")
-        if summary.get("disease_warnings"):
-            lines.append("Morphological screening notes:")
-            for w in summary["disease_warnings"]:
-                lines.append(f"  - {w}")
-        if summary["review_needed_count"] > 0:
-            lines.append("Action: unresolved or high-risk cells remain in the review queue.")
-        critical_flags = _meaningful_guideline_items(guidelines.critical_flags)
-        if critical_flags:
-            lines.append(f"Critical flag reminders: {', '.join(critical_flags)}")
-        content = "\n".join(lines)
+        content = _fill_zh_template(case_id, summary, guidelines, Path(self.guidelines_dir))
         safety = validate_report_safety(content, guidelines)
         if not safety["safe"]:
             raise ValueError(f"report violates prohibited claims: {safety['violations']}")
