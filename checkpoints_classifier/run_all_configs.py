@@ -38,11 +38,8 @@ PYTHON = sys.executable
 
 # Configs to benchmark
 CONFIGS = [
-    "dinobloom_focal_wrs",         # DinoBloom + Focal + WRS  [main]
-    "dinobloom_focal_wrs_stage2",  # DinoBloom + two-stage LDAM
-    "dinobloom_ce_uniform",        # DinoBloom + CE baseline
-    "focal_wrs",                   # ConvNeXt + Focal + WRS
-    "ce_uniform",                  # ConvNeXt + CE baseline
+    "dinobloom_ce_uniform",        # DinoBloom-B + CE uniform [best config from prev run]
+    "dinobloom_l_ce_uniform",      # DinoBloom-L + CE uniform [L vs B comparison]
 ]
 
 TEST_FRACTION = 0.15   # held-out test set (never seen by train.py)
@@ -75,8 +72,9 @@ def stratified_split_two(rows: list[dict], test_frac: float, seed: int):
 
 
 def write_split_csv(rows: list[dict], path: Path) -> None:
+    fieldnames = list(rows[0].keys()) if rows else ["status", "mask_path", "cell_type"]
     with path.open("w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["status", "mask_path", "cell_type"])
+        w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
         w.writerows(rows)
 

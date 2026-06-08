@@ -136,7 +136,7 @@ def load_classifier_records(path: Path) -> list[dict[str, Any]]:
     return payload
 
 
-def load_cell_map(path: Path | None) -> dict[str, str]:
+def load_cell_map(path: Path | None, image_dir: Path | None = None) -> dict[str, str]:
     if path is None:
         return {}
     mapping: dict[str, str] = {}
@@ -145,8 +145,15 @@ def load_cell_map(path: Path | None) -> dict[str, str]:
         if not {"image", "cell_id"}.issubset(reader.fieldnames or []):
             raise ValueError("--cell-map-csv must contain image and cell_id columns")
         for row in reader:
-            mapping[str(Path(row["image"]).resolve())] = row["cell_id"]
-            mapping[row["image"]] = row["cell_id"]
+            img_rel = row["image"]
+            cell_id = row["cell_id"]
+            mapping[img_rel] = cell_id
+            # Resolve relative to cell_map parent (session root) and to image_dir
+            # (medsam_output), since mask paths from the classifier are absolute
+            # paths inside medsam_output.
+            mapping[str((path.parent / img_rel).resolve())] = cell_id
+            if image_dir is not None:
+                mapping[str((image_dir / img_rel).resolve())] = cell_id
     return mapping
 
 
@@ -205,11 +212,18 @@ def ensure_cell(tools: AgentTools, case_id: str, cell_id: str, clean_patch_path:
                 1.0,
             ),
         )
-    return tools.get_cell(cell_id)
+    try:
+        return tools.get_cell(cell_id)
+    except KeyError:
+        # Cell exists but is_current=0 (previously excluded). Restore it so the
+        # classifier can update its label without re-creating an orphan.
+        with connect(tools.db_path) as conn:
+            conn.execute("UPDATE cells SET is_current=1 WHERE cell_id=?", (cell_id,))
+        return tools.get_cell(cell_id)
 
 
 def apply_records(tools: AgentTools, args: argparse.Namespace, records: list[dict[str, Any]]) -> dict[str, Any]:
-    cell_map = load_cell_map(args.cell_map_csv)
+    cell_map = load_cell_map(args.cell_map_csv, image_dir=args.image if args.image and args.image.is_dir() else None)
     applied: list[str] = []
     skipped_existing: list[str] = []
     created_or_reused: list[str] = []

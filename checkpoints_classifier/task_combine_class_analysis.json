@@ -1,0 +1,165 @@
+{
+  "total_ok": 21478,
+  "classes": [
+    {
+      "class": "apl_suspect",
+      "n_ok": 18,
+      "n_total": 18,
+      "medsam_ok_pct": 100.0,
+      "conf_mean": 0.7608,
+      "conf_min": 0.6971,
+      "conf_max": 0.8218,
+      "conf_median": 0.7645
+    },
+    {
+      "class": "artifact",
+      "n_ok": 13,
+      "n_total": 14,
+      "medsam_ok_pct": 92.86,
+      "conf_mean": 0.7562,
+      "conf_min": 0.6441,
+      "conf_max": 0.8582,
+      "conf_median": 0.7469
+    },
+    {
+      "class": "basophil",
+      "n_ok": 78,
+      "n_total": 78,
+      "medsam_ok_pct": 100.0,
+      "conf_mean": 0.7806,
+      "conf_min": 0.5638,
+      "conf_max": 0.8613,
+      "conf_median": 0.7817
+    },
+    {
+      "class": "early_pre_b",
+      "n_ok": 973,
+      "n_total": 985,
+      "medsam_ok_pct": 98.78,
+      "conf_mean": 0.8221,
+      "conf_min": 0.5162,
+      "conf_max": 0.9501,
+      "conf_median": 0.829
+    },
+    {
+      "class": "eosinophil",
+      "n_ok": 423,
+      "n_total": 423,
+      "medsam_ok_pct": 100.0,
+      "conf_mean": 0.7525,
+      "conf_min": 0.265,
+      "conf_max": 0.8728,
+      "conf_median": 0.7511
+    },
+    {
+      "class": "erythroid",
+      "n_ok": 78,
+      "n_total": 78,
+      "medsam_ok_pct": 100.0,
+      "conf_mean": 0.8088,
+      "conf_min": 0.7186,
+      "conf_max": 0.8717,
+      "conf_median": 0.8133
+    },
+    {
+      "class": "hematogone",
+      "n_ok": 498,
+      "n_total": 504,
+      "medsam_ok_pct": 98.81,
+      "conf_mean": 0.8387,
+      "conf_min": 0.5649,
+      "conf_max": 0.9608,
+      "conf_median": 0.851
+    },
+    {
+      "class": "mature_lymphocyte",
+      "n_ok": 3947,
+      "n_total": 3947,
+      "medsam_ok_pct": 100.0,
+      "conf_mean": 0.8094,
+      "conf_min": 0.4828,
+      "conf_max": 0.9002,
+      "conf_median": 0.8161
+    },
+    {
+      "class": "monoblast",
+      "n_ok": 26,
+      "n_total": 26,
+      "medsam_ok_pct": 100.0,
+      "conf_mean": 0.7124,
+      "conf_min": 0.5799,
+      "conf_max": 0.7783,
+      "conf_median": 0.726
+    },
+    {
+      "class": "monocyte",
+      "n_ok": 1756,
+      "n_total": 1756,
+      "medsam_ok_pct": 100.0,
+      "conf_mean": 0.7041,
+      "conf_min": 0.2546,
+      "conf_max": 0.8679,
+      "conf_median": 0.7246
+    },
+    {
+      "class": "myeloblast",
+      "n_ok": 42,
+      "n_total": 42,
+      "medsam_ok_pct": 100.0,
+      "conf_mean": 0.7505,
+      "conf_min": 0.6248,
+      "conf_max": 0.864,
+      "conf_median": 0.7447
+    },
+    {
+      "class": "myelocyte",
+      "n_ok": 3263,
+      "n_total": 3263,
+      "medsam_ok_pct": 100.0,
+      "conf_mean": 0.7607,
+      "conf_min": 0.2555,
+      "conf_max": 0.8806,
+      "conf_median": 0.7616
+    },
+    {
+      "class": "neutrophil",
+      "n_ok": 8524,
+      "n_total": 8524,
+      "medsam_ok_pct": 100.0,
+      "conf_mean": 0.7575,
+      "conf_min": 0.2525,
+      "conf_max": 0.9004,
+      "conf_median": 0.7634
+    },
+    {
+      "class": "other_immature",
+      "n_ok": 85,
+      "n_total": 85,
+      "medsam_ok_pct": 100.0,
+      "conf_mean": 0.7244,
+      "conf_min": 0.352,
+      "conf_max": 0.8608,
+      "conf_median": 0.7247
+    },
+    {
+      "class": "pre_b",
+      "n_ok": 961,
+      "n_total": 963,
+      "medsam_ok_pct": 99.79,
+      "conf_mean": 0.8389,
+      "conf_min": 0.5869,
+      "conf_max": 0.9549,
+      "conf_median": 0.8423
+    },
+    {
+      "class": "pro_b",
+      "n_ok": 793,
+      "n_total": 798,
+      "medsam_ok_pct": 99.37,
+      "conf_mean": 0.7597,
+      "conf_min": 0.2551,
+      "conf_max": 0.9338,
+      "conf_median": 0.7962
+    }
+  ]
+}

@@ -77,6 +77,10 @@ DINOBLOOM_B_CKPT = (
     Path(__file__).resolve().parents[2]
     / "artifacts" / "checkpoints" / "dinobloom" / "DinoBloom-B.pth"
 )
+DINOBLOOM_L_CKPT = (
+    Path(__file__).resolve().parents[2]
+    / "artifacts" / "checkpoints" / "dinobloom" / "DinoBloom-L.pth"
+)
 
 
 class DinoBloomClassifier(nn.Module):
@@ -155,6 +159,40 @@ def build_dinobloom(n_classes: int, ckpt_path: Path | None = None,
               f"unexpected={len(unexpected)})")
     else:
         print(f"  WARNING: DinoBloom checkpoint not found at {resolved}. Using random init.")
+    return DinoBloomClassifier(backbone, n_classes, head_type=head_type)
+
+
+def build_dinobloom_l(n_classes: int, ckpt_path: Path | None = None,
+                      head_type: str = "mlp") -> "DinoBloomClassifier":
+    """Load DINOBloom-L (ViT-L/14) backbone + fresh classification head.
+
+    Loads from local DinoBloom-L.pth if present; otherwise downloads from
+    HuggingFace (1aurent/vit_large_patch14_224.dinobloom) via timm.
+    """
+    import timm as _timm
+    resolved = Path(ckpt_path) if ckpt_path else DINOBLOOM_L_CKPT
+    if resolved.exists():
+        # Load architecture via timm, then apply our saved weights.
+        # DinoBloom-L was trained at 518×518 (pos_embed [1,1370,1024]) but we run
+        # at 224×224 ([1,257,1024]).  strict=False alone still raises RuntimeError on
+        # size mismatches, so drop shape-mismatched keys before loading.
+        backbone = _timm.create_model("vit_large_patch14_dinov2", pretrained=False, img_size=224)
+        raw = torch.load(resolved, map_location="cpu", weights_only=True)
+        model_state = backbone.state_dict()
+        filtered = {k: v for k, v in raw.items()
+                    if k in model_state and v.shape == model_state[k].shape}
+        missing, unexpected = backbone.load_state_dict(filtered, strict=False)
+        n_head = sum(1 for k in missing if "head" in k)
+        skipped = len(raw) - len(filtered)
+        print(f"  DinoBloom-L loaded from {resolved} "
+              f"(missing={len(missing) - n_head} non-head keys, "
+              f"unexpected={len(unexpected)}, shape-skipped={skipped})")
+    else:
+        print(f"  DinoBloom-L checkpoint not found at {resolved}. Downloading from HuggingFace...")
+        backbone = _timm.create_model(
+            "hf_hub:1aurent/vit_large_patch14_224.dinobloom", pretrained=True, img_size=224
+        )
+        print("  DinoBloom-L downloaded from HuggingFace.")
     return DinoBloomClassifier(backbone, n_classes, head_type=head_type)
 
 
@@ -672,6 +710,40 @@ CONFIGS: dict[str, dict] = {
         "weight_decay": 0.01,
         "eval_logit_adjustment": True,
     },
+    # ------------------------------------------------------------------
+    # DinoBloom-L configs — ViT-L/14, embed_dim=1024 (~307M params)
+    # Use lower backbone_lr than B (larger model, more cautious fine-tune)
+    # ------------------------------------------------------------------
+    "dinobloom_l_ce_uniform": {
+        "model": "dinobloom_l",
+        "loss": "ce",
+        "sampler": "uniform",
+        "stage2": False,
+        "cutmix": True,
+        "head_type": "mlp",
+        "stage1_epochs": 30,
+        "stage2_epochs": 0,
+        "lr": 1e-4,
+        "backbone_lr": 2e-6,
+        "batch_size": 16,        # L is larger — reduce batch to fit VRAM
+        "weight_decay": 0.01,
+        "eval_logit_adjustment": True,
+    },
+    "dinobloom_l_focal_wrs": {
+        "model": "dinobloom_l",
+        "loss": "focal",
+        "sampler": "wrs",
+        "stage2": False,
+        "cutmix": True,
+        "head_type": "mlp",
+        "stage1_epochs": 30,
+        "stage2_epochs": 0,
+        "lr": 1e-4,
+        "backbone_lr": 2e-6,
+        "batch_size": 16,
+        "weight_decay": 0.01,
+        "eval_logit_adjustment": True,
+    },
     "dinobloom_focal_wrs_stage2": {
         "model": "dinobloom",
         "loss": "focal",
@@ -717,6 +789,8 @@ def parse_args() -> argparse.Namespace:
                    help="Override Stage 2 epochs for smoke tests.")
     p.add_argument("--dinobloom-ckpt", type=Path, default=None,
                    help="Path to DinoBloom-B checkpoint. Defaults to artifacts/checkpoints/dinobloom/dinobloom-b.pth")
+    p.add_argument("--dinobloom-l-ckpt", type=Path, default=None,
+                   help="Path to DinoBloom-L checkpoint. Defaults to artifacts/checkpoints/dinobloom/DinoBloom-L.pth")
     p.add_argument("--num-seeds", type=int, default=1,
                    help="Repeat training with N seeds (42..42+N-1) and report mean±std. "
                         "Use 1 (default) for a single run.")
@@ -829,6 +903,9 @@ def main() -> None:
     if cfg["model"] == "dinobloom":
         model = build_dinobloom(n_classes, ckpt_path=args.dinobloom_ckpt,
                                 head_type=cfg.get("head_type", "mlp"))
+    elif cfg["model"] == "dinobloom_l":
+        model = build_dinobloom_l(n_classes, ckpt_path=args.dinobloom_l_ckpt,
+                                  head_type=cfg.get("head_type", "mlp"))
     elif cfg["model"] == "efficientv2":
         model = build_efficientnet_v2(n_classes, pretrained=True)
     elif cfg["model"] == "resnet101":
@@ -848,7 +925,7 @@ def main() -> None:
         criterion = nn.CrossEntropyLoss()
 
     # DinoBloom uses two param groups: backbone (lower LR) + head (higher LR)
-    if cfg["model"] == "dinobloom":
+    if cfg["model"] in ("dinobloom", "dinobloom_l"):
         backbone_lr = cfg.get("backbone_lr", cfg["lr"] * 0.1)
         optimizer = torch.optim.AdamW(
             [
@@ -919,7 +996,7 @@ def main() -> None:
         print(f"\n--- Stage 2: {total_s2} epochs (backbone frozen, LDAM) ---")
 
         # Freeze backbone; keep classifier head trainable
-        if cfg["model"] == "dinobloom":
+        if cfg["model"] in ("dinobloom", "dinobloom_l"):
             for p in model.backbone.parameters():
                 p.requires_grad = False
             head_params = list(model.head.parameters())

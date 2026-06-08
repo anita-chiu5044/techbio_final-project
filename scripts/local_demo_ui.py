@@ -16,6 +16,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 import traceback
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -215,27 +216,30 @@ def load_case(ctx: DemoContext, session_id: str) -> dict:
     tools = ctx.tools(session_id)
     summary = tools.summarize_case(case_id)
     cells = tools.list_cells(case_id)
+    session_input_dir = ctx.session_dir(session_id) / "input_images"
     for cell in cells:
         for key in ("clean_patch_path", "mask_path"):
             value = cell.get(key)
             if value and not Path(value).exists():
                 cell[key] = None
+        # Ensure roi_image_path is a real image file (not a directory, not missing).
+        # Fall back to any image in session_input_dir so the canvas always works.
+        roi = cell.get("roi_image_path")
+        roi_path = Path(roi) if roi else None
+        if not roi_path or not roi_path.is_file():
+            fallback = first_image_in_dir(session_input_dir)
+            cell["roi_image_path"] = str(fallback.resolve()) if fallback else None
     report = tools.generate_case_report(case_id)
-    # Get original image path from cases table
+    # Get original image path from cases table (session-level fallback).
     with sqlite3.connect(db) as conn:
         row = conn.execute("SELECT original_image_path FROM cases WHERE case_id=?", (case_id,)).fetchone()
     original_image = str(row[0]) if row else None
-    original_candidates = [
-        ctx.session_dir(session_id) / "input_images",
-        ctx.upload_root / session_id,
-    ]
-    if original_image:
-        original_candidates.append(Path(original_image))
-    for candidate in original_candidates:
-        image = first_image_in_dir(candidate)
-        if image is not None:
-            original_image = str(image.resolve())
-            break
+    # Must be an actual file, not a directory.
+    if not original_image or not Path(original_image).is_file():
+        fallback = first_image_in_dir(ctx.session_dir(session_id) / "input_images")
+        if fallback is None:
+            fallback = first_image_in_dir(ctx.upload_root / session_id)
+        original_image = str(fallback.resolve()) if fallback else original_image
     return {
         "session_id": session_id,
         "case_id": case_id,
@@ -421,34 +425,32 @@ def run_pipeline(ctx: DemoContext, fields: dict[str, str], files: list[tuple[str
     upload_dir = ctx.upload_root / session_id
     session_input_dir = ctx.session_dir(session_id) / "input_images"
     upload_dir.mkdir(parents=True, exist_ok=True)
-    session_input_dir.mkdir(parents=True, exist_ok=True)  # keep existing images; accumulate
+    session_input_dir.mkdir(parents=True, exist_ok=True)
     if not files:
         raise ValueError("At least one image file is required")
     saved_upload_files: list[str] = []
     saved_session_files: list[str] = []
-    # Save all uploaded files in upload_root and mirror them into the persistent
-    # session artifact folder so bbox review/rerun can always find originals.
-    # The persistent input_images folder is reset per upload, so YOLO only sees
-    # files selected in this run. Filenames are still de-duplicated within both dirs.
+    # Each upload gets its own run folder so YOLO only processes the newly uploaded
+    # files — not old images from previous uploads in the same session.
+    # session_input_dir still accumulates all images for original-image display.
+    run_dir = upload_dir / f"run_{int(time.time() * 1000)}"
+    run_dir.mkdir(parents=True, exist_ok=True)
     for filename, content in files:
         base = Path(filename or "upload.png")
-        dest = upload_dir / base.name
-        counter = 1
-        while dest.exists():
-            dest = upload_dir / f"{base.stem}_{counter:03d}{base.suffix}"
-            counter += 1
-        dest.write_bytes(content)
-        saved_upload_files.append(str(dest))
-
-        session_dest = session_input_dir / dest.name
+        # Permanent dedup copy in session_input_dir (for original-image lookup)
+        session_dest = session_input_dir / base.name
         session_counter = 1
         while session_dest.exists():
-            session_dest = session_input_dir / f"{dest.stem}_{session_counter:03d}{dest.suffix}"
+            session_dest = session_input_dir / f"{base.stem}_{session_counter:03d}{base.suffix}"
             session_counter += 1
         session_dest.write_bytes(content)
-        saved_session_files.append(str(session_dest))
-    # Input is the persistent session folder (YOLO processes all images in it).
-    input_path = session_input_dir
+        saved_upload_files.append(str(session_dest))
+        # Per-run copy: YOLO input for this upload only (no dedup needed — fresh dir)
+        run_dest = run_dir / base.name
+        run_dest.write_bytes(content)
+        saved_session_files.append(str(run_dest))
+    # YOLO processes only the new files in this upload.
+    input_path = run_dir
     cmd = [
         sys.executable, str(REPO_ROOT / "scripts" / "run_full_agent_pipeline.py"),
         "--input", str(input_path),
@@ -461,7 +463,8 @@ def run_pipeline(ctx: DemoContext, fields: dict[str, str], files: list[tuple[str
         "--logit-adjustment",
         "--output-root", str(ctx.output_root),
         "--start-at", fields.get("start_at", "yolo") if fields.get("start_at", "yolo") in VALID_PIPELINE_STAGES else "yolo",
-        "--yolo-gate-conf", str(min(1.0, max(0.0, float(fields.get("yolo_gate_conf", "0.90") or "0.90")))),
+        "--yolo-gate-conf", str(min(1.0, max(0.0, float(fields.get("yolo_gate_conf", "0.50") or "0.50")))),
+        "--yolo-nms-iou", str(min(1.0, max(0.0, float(fields.get("yolo_nms_iou", "0.45") or "0.45")))),
         "--yolo-python", ctx.yolo_python,
         "--medsam-python", ctx.medsam_python,
         "--classifier-python", ctx.classifier_python,
@@ -594,7 +597,10 @@ pre{white-space:pre-wrap;word-break:break-word;background:#f8fafc;padding:8px;bo
             <option value='agent'>Re-ingest into DB only</option>
           </select>
           <label class='muted' style='display:block;margin-top:5px;font-size:10px'>YOLO gate confidence</label>
-          <input name='yolo_gate_conf' type='number' min='0' max='1' step='0.01' value='0.90'/>
+          <label class='muted' style='display:block;font-size:10px'>YOLO gate confidence (cells below are flagged for review, not skipped)</label>
+          <input name='yolo_gate_conf' type='number' min='0' max='1' step='0.01' value='0.50'/>
+          <label class='muted' style='display:block;margin-top:5px;font-size:10px'>NMS IoU threshold (higher = keep more overlapping cells)</label>
+          <input name='yolo_nms_iou' type='number' min='0' max='1' step='0.05' value='0.45'/>
         </details>
         <button class='primary' type='submit' style='width:100%;margin-top:6px'>Run Pipeline</button>
       </form>
@@ -760,11 +766,14 @@ function showPage(name){
 /* --- session --- */
 function _setActiveSessionLabel(name){const el=document.getElementById('activeSessionLabel');if(el)el.textContent=name;}
 async function listSessions(){const d=await api('/api/sessions');const s=document.getElementById('sessionSelect');s.innerHTML='';d.sessions.forEach(n=>{const o=document.createElement('option');o.value=n;o.textContent=n;if(n===currentSession)o.selected=true;s.appendChild(o)})}
+const _chatLogs={};
+function _saveChatLog(){if(currentSession)_chatLogs[currentSession]=document.getElementById('chatlog').innerHTML;}
+function _restoreChatLog(session){document.getElementById('chatlog').innerHTML=_chatLogs[session]||'';}
 async function loadSelected(){currentSession=document.getElementById('sessionSelect').value;await loadCase(currentSession)}
-async function loadCase(session){try{const d=await api('/api/case?session_id='+encodeURIComponent(session));currentCase=d;currentSession=session;_setActiveSessionLabel(session);render()}catch(e){alert(e.message)}}
-function newSession(){const raw=(document.getElementById('newSessionInput').value||'').trim();if(!raw){alert('Enter a session name');return;}const name=raw.slice(0,80).replace(/[^A-Za-z0-9_-]+/g,'_')||'new_session';currentSession=name;currentCase=null;currentCell=null;_setActiveSessionLabel(name);document.getElementById('newSessionInput').value='';listSessions();render();}
+async function loadCase(session){try{_saveChatLog();const d=await api('/api/case?session_id='+encodeURIComponent(session));currentCase=d;currentCell=null;currentSession=session;_setActiveSessionLabel(session);_restoreChatLog(session);render()}catch(e){alert(e.message)}}
+function newSession(){const raw=(document.getElementById('newSessionInput').value||'').trim();if(!raw){alert('Enter a session name');return;}const name=raw.slice(0,80).replace(/[^A-Za-z0-9_-]+/g,'_')||'new_session';_saveChatLog();currentSession=name;currentCase=null;currentCell=null;_setActiveSessionLabel(name);document.getElementById('newSessionInput').value='';const sel=document.getElementById('sessionSelect');if(![...sel.options].some(o=>o.value===name)){const opt=document.createElement('option');opt.value=name;opt.textContent=name+' (new)';sel.insertBefore(opt,sel.firstChild);}sel.value=name;document.getElementById('summary').innerHTML='<span class="muted">Session <b>'+esc(name)+'</b> ready — upload images to start.</span>';document.getElementById('cells').innerHTML='';document.getElementById('report').textContent='';}
 
-function render(){renderSummary();renderCells();renderReport();if(currentCell){currentCell=(currentCase.cells||[]).find(c=>c.cell_id===currentCell.cell_id)||null;if(currentCell)renderDetail()}}
+function render(){if(!currentCase)return;renderSummary();renderCells();renderReport();if(currentCell){currentCell=(currentCase.cells||[]).find(c=>c.cell_id===currentCell.cell_id)||null;if(currentCell)renderDetail()}}
 
 function renderSummary(){const s=currentCase.summary;if(!s)return;document.getElementById('summary').innerHTML=[['Total cells',s.total_cells],['Review needed',s.review_needed_count],['Review-ready',s.hard_count_total],['Excluded',s.excluded_count]].map(([k,v])=>`<div class="stat-row"><span>${k}</span><b>${v}</b></div>`).join('')+'<div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:3px">'+Object.entries(s.hard_counts||{}).map(([k,v])=>`<span class="chip info">${esc(k)}:${v}</span>`).join('')+'</div>';const w=s.disease_warnings||[];document.getElementById('warnings').innerHTML=w.length?w.map(x=>`<div class="chip warn" style="margin:2px 0">${esc(x)}</div>`).join(''):'<span class="chip ok">OK</span>'}
 
@@ -782,7 +791,7 @@ function renderDetail(){
   const d=document.getElementById('detail');const c=currentCell;
   if(!c){d.innerHTML='<span class="muted">Select a cell.</span>';return}
   const probs=c.probabilities||{};
-  const bars=Object.entries(probs).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([k,v])=>`<div style="display:flex;align-items:center;gap:4px;margin:1px 0"><span style="width:32px;font-size:11px;text-align:right;font-weight:500">${esc(k)}</span><div style="flex:1;height:12px;background:#f3f4f6;border-radius:2px;overflow:hidden"><div style="height:100%;width:${(v*100).toFixed(1)}%;background:${k===c.model_label?'var(--accent)':'#cbd5e1'};border-radius:2px"></div></div><span class="muted" style="width:36px;font-size:10px">${(v*100).toFixed(1)}%</span></div>`).join('');
+  const bars=Object.entries(probs).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([k,v])=>`<div style="margin:2px 0"><div style="display:flex;justify-content:space-between;font-size:11px;font-weight:500;margin-bottom:1px"><span style="${k===c.model_label?'color:var(--accent)':''}">${esc(k)}</span><span class="muted">${(v*100).toFixed(1)}%</span></div><div style="height:8px;background:#f3f4f6;border-radius:2px;overflow:hidden"><div style="height:100%;width:${(v*100).toFixed(1)}%;background:${k===c.model_label?'var(--accent)':'#cbd5e1'};border-radius:2px"></div></div></div>`).join('');
   /* bbox overlay on original YOLO input image */
   const bbox=c.bbox_xyxy_original;
   const origImg=c.roi_image_path||currentCase.original_image;
@@ -802,10 +811,18 @@ function renderDetail(){
 <div class="muted" style="margin-bottom:4px">Status: ${esc(c.review_status)}${c.review_label?' &rarr; <b>'+esc(c.review_label)+'</b>':''}</div>
 <h3>Detection / Segmentation</h3>
 <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;margin-bottom:6px;font-size:11px">
-  <div><span class="muted">YOLO class</span><br><b>${esc(c.yolo_class_name||'')}</b></div>
-  <div><span class="muted">YOLO confidence</span><br><b>${c.yolo_confidence!=null?(c.yolo_confidence*100).toFixed(1)+'%':'n/a'}</b></div>
+  <div><span class="muted">YOLO class</span><br><b>${esc(c.yolo_class_name||'WBC')}</b></div>
+  <div><span class="muted">YOLO confidence</span><br><b>${c.yolo_confidence!=null?(c.yolo_confidence*100).toFixed(1)+'%':c.cell_id?.startsWith('manual_')?'manual draw':'—'}</b></div>
   <div><span class="muted">MedSAM status</span><br><b>${esc(c.segmentation_status||'pending')}</b></div>
-  <div><span class="muted">MedSAM quality</span><br><b>${c.segmentation_quality!=null?(c.segmentation_quality*100).toFixed(1)+'%':'n/a'}</b></div>
+  <div><span class="muted">MedSAM quality</span><br><b>${(()=>{
+    const q=c.segmentation_quality,s=c.segmentation_status;
+    if(q!=null)return(q*100).toFixed(1)+'%';
+    if(!s||s==='pending')return'n/a — not yet sent to MedSAM';
+    if(s==='skipped_existing')return'n/a — used cached mask';
+    if(!c.downstream_eligible)return'n/a — YOLO gated';
+    if(s==='failed')return'n/a — MedSAM found no cell';
+    return'n/a';
+  })()}</b></div>
 </div>
 <h3>Top Probabilities</h3>${bars}
 <h3>QC Flags</h3>
@@ -848,12 +865,16 @@ ${!c.downstream_eligible&&c.review_status==='queued_for_review'?`
       };
       bgImg.src=fileUrl(origImg);
 
-      const cellSrcImg=(c.roi_image_path||'').replace(/\\\\/g,'/');
+      /* Use the loaded background image path for grouping, not c.roi_image_path
+         (which may differ from origImg when roi_image_path is null and origImg
+         falls back to currentCase.original_image). */
+      const cellSrcImg=(origImg||'').replace(/\\\\/g,'/');
       function drawAllBoxes(){
         ctx2.drawImage(bgImg,0,0);
-        /* only draw cells whose source image matches this cell's source image */
+        /* only draw cells whose source image matches the displayed background */
         (currentCase.cells||[]).forEach(oc=>{
-          if(cellSrcImg&&(oc.roi_image_path||'').replace(/\\\\/g,'/')!==cellSrcImg)return;
+          const ocSrc=(oc.roi_image_path||'').replace(/\\\\/g,'/');
+          if(cellSrcImg&&ocSrc&&ocSrc!==cellSrcImg)return;
           if(oc.bbox_xyxy_original&&oc.bbox_xyxy_original.length===4){
             const ob=oc.bbox_xyxy_original;
             const isSelected=currentCell&&oc.cell_id===currentCell.cell_id;

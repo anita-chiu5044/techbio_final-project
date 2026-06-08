@@ -81,6 +81,9 @@ def parse_args() -> argparse.Namespace:
                         help="YOLO confidence threshold for downstream gating. "
                              "Detections below this are imported but marked downstream_eligible=0 "
                              "and queued for manual review. Set to 0 to disable gating.")
+    parser.add_argument("--yolo-nms-iou", type=float, default=0.45,
+                        help="IoU threshold for WBC NMS deduplication. Higher = keep more "
+                             "overlapping cells (useful for dense clusters). Default 0.45.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print commands only. Does not run models or write DB updates.")
     parser.add_argument("--start-at", choices=["yolo", "roi", "medsam", "classifier", "agent"], default="yolo",
@@ -146,6 +149,180 @@ def write_review_exclude_file(args: argparse.Namespace, session: dict[str, Path]
     out = session["root"] / "rerun_excluded_detections.json"
     out.write_text(json.dumps({"gated_ids": sorted(excluded_ids)}, indent=2))
     return out
+
+
+TILE_THRESHOLD = 1200   # auto-tile if image width or height exceeds this (pixels)
+TILE_SIZE      = 640    # tile side length fed to YOLO
+TILE_STRIDE    = 600    # stride between tiles (40 px overlap for boundary cells)
+_TILE_SEP      = "__tile_"  # separator in tile filename so we can parse it back
+
+
+def _image_size(path: Path) -> tuple[int, int]:
+    """Return (width, height) without importing PIL at module level."""
+    from PIL import Image as _PIL
+    with _PIL.open(path) as im:
+        return im.size  # (w, h)
+
+
+def _tile_image(img_path: Path, tile_dir: Path) -> dict[str, tuple[str, int, int, int, int]]:
+    """Slice img_path into TILE_SIZE×TILE_SIZE patches saved under tile_dir.
+
+    Returns tile_abs_path → (orig_image_path, tile_x, tile_y, orig_w, orig_h).
+    """
+    from PIL import Image as _PIL
+    tile_dir.mkdir(parents=True, exist_ok=True)
+    img = _PIL.open(img_path)
+    orig_w, orig_h = img.size
+    meta: dict[str, tuple[str, int, int, int, int]] = {}
+    orig_str = str(img_path.resolve())
+    for ty in range(0, max(orig_h - TILE_SIZE + 1, 1), TILE_STRIDE):
+        for tx in range(0, max(orig_w - TILE_SIZE + 1, 1), TILE_STRIDE):
+            tile = img.crop((tx, ty, min(tx + TILE_SIZE, orig_w), min(ty + TILE_SIZE, orig_h)))
+            tile_name = f"{img_path.stem}{_TILE_SEP}{ty:05d}_{tx:05d}{img_path.suffix}"
+            tile_path = tile_dir / tile_name
+            tile.save(tile_path)
+            meta[str(tile_path.resolve())] = (orig_str, tx, ty, orig_w, orig_h)
+    return meta
+
+
+def prepare_yolo_input(
+    dataset_root: Path,
+    session_dir: Path,
+    dry_run: bool,
+) -> tuple[Path, dict[str, tuple[str, int, int, int, int]]]:
+    """Auto-tile any large images in dataset_root before YOLO.
+
+    Returns:
+      yolo_input_dir  — directory to pass to YOLO (tiles dir or original)
+      tile_meta       — map from tile abs path → (orig_path, tile_x, tile_y, orig_w, orig_h)
+                        Empty dict if no tiling was needed.
+    """
+    IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
+    images = [p for p in dataset_root.rglob("*") if p.suffix.lower() in IMAGE_EXTS]
+    if not images:
+        return dataset_root, {}
+
+    needs_tiling = False
+    for img in images:
+        try:
+            w, h = _image_size(img)
+            if w > TILE_THRESHOLD or h > TILE_THRESHOLD:
+                needs_tiling = True
+                break
+        except Exception:
+            pass
+
+    if not needs_tiling:
+        return dataset_root, {}
+
+    tile_dir = session_dir / "01_yolo_tiles"
+    tile_meta: dict[str, tuple[str, int, int, int, int]] = {}
+
+    if not dry_run:
+        for img in images:
+            try:
+                w, h = _image_size(img)
+                if w > TILE_THRESHOLD or h > TILE_THRESHOLD:
+                    print(f"  [tile] {img.name} ({w}×{h}) → tiles of {TILE_SIZE}px")
+                    tile_meta.update(_tile_image(img, tile_dir / img.parent.relative_to(dataset_root)))
+                else:
+                    dest = tile_dir / img.parent.relative_to(dataset_root) / img.name
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    dest.symlink_to(img.resolve())
+            except Exception as e:
+                print(f"  [tile] WARNING: could not tile {img.name}: {e}")
+
+    return tile_dir, tile_meta
+
+
+def fix_tiled_detections(jsonl_path: Path, tile_meta: dict[str, tuple[str, int, int, int, int]]) -> None:
+    """Rewrite detections.jsonl: offset bbox coords and fix source_image_path for tiled images."""
+    if not tile_meta or not jsonl_path.exists():
+        return
+
+    lines_out: list[str] = []
+    fixed = 0
+    dropped = 0
+    with jsonl_path.open() as f:
+        for line in f:
+            det = json.loads(line)
+            src = Path(det.get("source_image_path", ""))
+            key = str(src.resolve())
+            if key in tile_meta:
+                orig_path, tx, ty, orig_w, orig_h = tile_meta[key]
+                bb = det.get("bbox_xyxy_original")
+                if bb and len(bb) == 4:
+                    # Drop detections clipped at interior tile edges (not image boundaries).
+                    # A bbox touching the tile's right/bottom edge when the tile doesn't
+                    # extend to the image edge is a partial clip; the adjacent tile will
+                    # have a complete detection with higher IoU, so NMS won't suppress both.
+                    tile_right = tx + TILE_SIZE
+                    tile_bottom = ty + TILE_SIZE
+                    clipped_right = bb[2] >= TILE_SIZE - 1 and tile_right < orig_w
+                    clipped_bottom = bb[3] >= TILE_SIZE - 1 and tile_bottom < orig_h
+                    clipped_left = bb[0] <= 0 and tx > 0
+                    clipped_top = bb[1] <= 0 and ty > 0
+                    if clipped_right or clipped_bottom or clipped_left or clipped_top:
+                        dropped += 1
+                        continue
+                # Point source back to original (non-tiled) image
+                det["source_image_path"] = orig_path
+                det["source_image_relative_path"] = Path(orig_path).name
+                # Offset bounding boxes into original image coords
+                for bbox_key in ("bbox_xyxy_original", "bbox_xyxy_clipped"):
+                    b = det.get(bbox_key)
+                    if b and len(b) == 4:
+                        det[bbox_key] = [b[0] + tx, b[1] + ty, b[2] + tx, b[3] + ty]
+                det["image_width"] = orig_w
+                det["image_height"] = orig_h
+                fixed += 1
+            lines_out.append(json.dumps(det))
+
+    jsonl_path.write_text("\n".join(lines_out) + "\n")
+    print(f"  [tile] Remapped {fixed} tile detections → original coords, dropped {dropped} boundary clips")
+
+
+def prefix_detection_ids_in_jsonl(jsonl_path: Path) -> None:
+    """Prefix each detection_id with the source-image stem so IDs are unique across images.
+
+    Called after fix_tiled_detections (which corrects source_image_path) and BEFORE ROI
+    extraction so that cell_map.csv and the DB both use the same prefixed IDs.
+    """
+    if not jsonl_path.exists():
+        return
+    lines_out: list[str] = []
+    prefixed = 0
+    with jsonl_path.open() as f:
+        for line in f:
+            det = json.loads(line)
+            src_stem = Path(det.get("source_image_path", "unknown")).stem
+            old_id = det.get("detection_id", "")
+            prefix = src_stem + "_"
+            if old_id and not old_id.startswith(prefix):
+                det["detection_id"] = prefix + old_id
+                prefixed += 1
+            lines_out.append(json.dumps(det))
+    jsonl_path.write_text("\n".join(lines_out) + "\n")
+    if prefixed:
+        print(f"  [prefix] Prefixed {prefixed} detection IDs with image stem in {jsonl_path.name}")
+
+
+def apply_nms_to_jsonl(jsonl_path: Path, iou_threshold: float = 0.45) -> None:
+    """Apply WBC NMS in-place to detections.jsonl, removing suppressed detections.
+
+    Called after prefix_detection_ids_in_jsonl and BEFORE ROI extraction so that
+    MedSAM and the classifier only ever see detections that will actually reach the DB.
+    Without this, NMS-suppressed detections still get MedSAM patches + classifier labels,
+    and the classifier re-inserts them as orphan cells with bbox=[0,0,1,1].
+    """
+    if not jsonl_path.exists():
+        return
+    raw = read_jsonl(jsonl_path)
+    filtered = wbc_nms(raw, iou_threshold=iou_threshold)
+    suppressed = len(raw) - len(filtered)
+    if suppressed > 0:
+        jsonl_path.write_text("\n".join(json.dumps(d) for d in filtered) + "\n")
+        print(f"  [nms] Removed {suppressed} NMS-suppressed detections from {jsonl_path.name}")
 
 
 def input_dataset_root(input_path: Path, session_dir: Path, dry_run: bool) -> tuple[Path, str | None]:
@@ -244,14 +421,10 @@ def ensure_case_and_import_yolo(args: argparse.Namespace, session: dict[str, Pat
         else det
         for det in raw_detections
     ]
-    # Prefix detection_id with image stem so IDs are unique across images in a
-    # multi-image session.  This ensures re-uploading the same image replaces its
-    # cells (ON CONFLICT UPDATE) while a new image adds distinct cells.
-    raw_detections = [
-        {**det, "detection_id": f"{Path(det.get('source_image_path', 'unknown')).stem}_{det['detection_id']}"}
-        for det in raw_detections
-    ]
-    detections = wbc_nms(raw_detections, iou_threshold=0.30)
+    # Detection IDs are already prefixed with the image stem by prefix_detection_ids_in_jsonl
+    # (called in main() after fix_tiled_detections, before ROI extraction).  No in-memory
+    # re-prefixing needed here.
+    detections = wbc_nms(raw_detections, iou_threshold=getattr(args, "yolo_nms_iou", 0.45))
     imported = 0
     gated = 0
     gate_conf = getattr(args, "yolo_gate_conf", 0.50)
@@ -279,19 +452,20 @@ def ensure_case_and_import_yolo(args: argparse.Namespace, session: dict[str, Pat
             tools.import_yolo_detection(effective_case_id(args), rec, cell_id=rec["detection_id"])
         imported += 1
     print(f"Imported WBC YOLO detections: {imported} (gated: {gated} below conf={gate_conf})")
-    # Write gated detection IDs so ROI stage can skip them
-    if gated > 0:
-        gated_ids = []
-        for rec in detections:
-            if rec.get("class_label") == "WBC" and float(rec.get("confidence", 0)) < gate_conf:
-                gated_ids.append(rec["detection_id"])
-        (session["root"] / "gated_detections.json").write_text(
-            json.dumps({"gate_conf": gate_conf, "gated_ids": gated_ids}, indent=2)
-        )
+    # Always rewrite gated_detections.json so stale entries from previous runs with
+    # a higher gate threshold don't persist and incorrectly block cells from MedSAM.
+    gated_ids = [
+        rec["detection_id"]
+        for rec in detections
+        if rec.get("class_label") == "WBC" and float(rec.get("confidence", 0)) < gate_conf
+    ]
+    (session["root"] / "gated_detections.json").write_text(
+        json.dumps({"gate_conf": gate_conf, "gated_ids": gated_ids}, indent=2)
+    )
     return tools
 
 
-def load_cell_map(path: Path) -> dict[str, str]:
+def load_cell_map(path: Path, medsam_output: Path | None = None) -> dict[str, str]:
     mapping: dict[str, str] = {}
     if not path.exists():
         return mapping
@@ -302,12 +476,14 @@ def load_cell_map(path: Path) -> dict[str, str]:
             cell_id = row["cell_id"]
             mapping[image] = cell_id
             mapping[str((path.parent / image).resolve())] = cell_id
+            if medsam_output is not None:
+                mapping[str((medsam_output / image).resolve())] = cell_id
     return mapping
 
 
 def apply_medsam_summary(tools: AgentTools, session: dict[str, Path]) -> int:
     summary = session["medsam_output"] / "inference_summary.csv"
-    mapping = load_cell_map(session["cell_map"])
+    mapping = load_cell_map(session["cell_map"], medsam_output=session["medsam_output"])
     if not summary.exists():
         print("MedSAM summary not found (stage was skipped) — no MedSAM results to apply")
         return 0
@@ -413,10 +589,13 @@ def main() -> None:
 
     dataset_root, path_prefix = input_dataset_root(args.input, root, args.dry_run)
 
+    # Auto-tile large images so YOLO can detect cells at proper resolution
+    yolo_input, tile_meta = prepare_yolo_input(dataset_root, root, args.dry_run)
+
     if should_run(args, "yolo"):
         cmd = [
             args.yolo_python or args.python_executable, REPO_ROOT / "export_yolo_detection_manifest.py",
-            "--dataset-root", dataset_root,
+            "--dataset-root", yolo_input,
             "--output-root", session["yolo"],
             "--model-path", args.yolo_model,
             "--device", args.yolo_device,
@@ -432,10 +611,17 @@ def main() -> None:
         if path_prefix:
             cmd.extend(["--path-prefix", path_prefix])
         run(cmd, dry_run=args.dry_run)
+        # Remap tile coords → original image coords in detections.jsonl
+        fix_tiled_detections(session["yolo"] / "detections.jsonl", tile_meta)
+        # Prefix detection_id with image stem so IDs in detections.jsonl, cell_map.csv,
+        # and the DB all agree (must happen before ROI extraction writes cell_map.csv).
+        prefix_detection_ids_in_jsonl(session["yolo"] / "detections.jsonl")
+        apply_nms_to_jsonl(session["yolo"] / "detections.jsonl",
+                           iou_threshold=getattr(args, "yolo_nms_iou", 0.45))
 
     if should_run(args, "roi"):
         if not args.dry_run:
-            reset_stage_dir(session["medsam_input"])
+            session["medsam_input"].mkdir(parents=True, exist_ok=True)
         roi_cmd = [
             args.python_executable, REPO_ROOT / "yolo_to_medsam_patches.py",
             "--detections", session["yolo"] / "detections.jsonl",
@@ -455,7 +641,7 @@ def main() -> None:
             print("No .tiff patches in medsam_input — skipping MedSAM stage")
         else:
             if not args.dry_run:
-                reset_stage_dir(session["medsam_output"])
+                session["medsam_output"].mkdir(parents=True, exist_ok=True)
             cmd = [
                 args.medsam_python or args.python_executable, REPO_ROOT / "MedSAM3" / "tiff_wbc_inference.py",
                 "--data-root", session["medsam_input"],
@@ -467,9 +653,8 @@ def main() -> None:
                 "--masked-output",
                 "--fill-holes",
                 "--erythroid-categories",
+                "--skip-existing",  # always skip already-processed patches from prior uploads
             ]
-            if args.skip_existing:
-                cmd.append("--skip-existing")
             if args.medsam_max_images is not None:
                 cmd.extend(["--max-images", args.medsam_max_images])
             run(cmd, cwd=args.medsam3_dir, dry_run=args.dry_run)

@@ -142,7 +142,7 @@ def step4_medsam(dry_run: bool) -> int:
 
 
 def step5_collect_csv(dry_run: bool) -> None:
-    """Read inference_summary.csv and write final training CSV."""
+    """Read inference_summary.csv and write final training CSV with YOLO confidence."""
     print("\n=== Step 5: Collect MedSAM outputs into training CSV ===")
     summary_csv = MEDSAM_OUTPUT / "inference_summary.csv"
     if dry_run:
@@ -152,34 +152,108 @@ def step5_collect_csv(dry_run: bool) -> None:
         print(f"  ERROR: {summary_csv} not found. MedSAM may have failed.")
         return
 
+    # Build detection_id → (confidence, class_label) from YOLO detections
+    import json as _json
+    det_info: dict[str, tuple[float, str]] = {}
+    jsonl = YOLO_OUT / "detections.jsonl"
+    if jsonl.exists():
+        with jsonl.open() as f:
+            for line in f:
+                d = _json.loads(line)
+                det_info[d["detection_id"]] = (d.get("confidence", 0.0), d.get("class_label", ""))
+
+    # Build mask stem → detection_id from cell_map
+    # cell_map image column: "class/class/STEM_mask.png"
+    stem_to_det: dict[str, str] = {}
+    if CELL_MAP_CSV.exists():
+        with CELL_MAP_CSV.open() as f:
+            for row in csv.DictReader(f):
+                stem = Path(row["image"]).stem  # e.g. "PMB_0001_det_000006_mask" → strip _mask below
+                det_id = row.get("detection_id") or row.get("cell_id", "")
+                stem_to_det[stem] = det_id
+
+    def _get_conf(image_name: str) -> tuple[float, str]:
+        """image_name is the tiff patch name, e.g. PMB_0001_det_000006.tiff"""
+        stem = Path(image_name).stem  # PMB_0001_det_000006
+        mask_stem = stem + "_mask"    # PMB_0001_det_000006_mask
+        det_id = stem_to_det.get(mask_stem, "")
+        if det_id and det_id in det_info:
+            return det_info[det_id]
+        # fallback: extract det_id from stem suffix
+        if "_det_" in stem:
+            det_id = "det_" + stem.split("_det_")[-1]
+            if det_id in det_info:
+                return det_info[det_id]
+        return (0.0, "")
+
     rows_ok: list[dict] = []
     rows_fail = 0
     with summary_csv.open(newline="") as f:
         for row in csv.DictReader(f):
             if row["status"].upper() == "OK" and row.get("mask_path"):
                 mask_path = Path(row["mask_path"])
-                # cell_type from mask_path.parent.name — this is the class name
                 cell_type = mask_path.parent.name
+                conf, cls_label = _get_conf(row["image"])
                 rows_ok.append({
                     "status": "OK",
                     "mask_path": str(mask_path),
                     "cell_type": cell_type,
+                    "yolo_confidence": round(conf, 6),
+                    "yolo_class_label": cls_label,
                 })
             else:
                 rows_fail += 1
 
     with FINAL_CSV.open("w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["status", "mask_path", "cell_type"])
+        w = csv.DictWriter(f, fieldnames=["status", "mask_path", "cell_type", "yolo_confidence", "yolo_class_label"])
         w.writeheader()
         w.writerows(rows_ok)
 
-    from collections import Counter
-    counts = Counter(r["cell_type"] for r in rows_ok)
+    # ── Per-class analysis ────────────────────────────────────────────────────
+    import json as _json2
+    import statistics as _stats
+    from collections import Counter, defaultdict
+
+    # Also load ALL summary rows (including failed) for MedSAM quality per class
+    all_rows_by_class: dict[str, list[str]] = defaultdict(list)
+    ok_rows_by_class:  dict[str, list[str]] = defaultdict(list)
+    with summary_csv.open(newline="") as f:
+        for row in csv.DictReader(f):
+            cls = row.get("cell_type", "unknown")
+            all_rows_by_class[cls].append(row["status"])
+            if row["status"].upper() == "OK":
+                ok_rows_by_class[cls].append(row["status"])
+
+    conf_by_class: dict[str, list[float]] = defaultdict(list)
+    for r in rows_ok:
+        conf_by_class[r["cell_type"]].append(r["yolo_confidence"])
+
+    analysis: list[dict] = []
+    all_classes = sorted(set(list(all_rows_by_class) + list(conf_by_class)))
     print(f"\nFinal training CSV: {FINAL_CSV}")
-    print(f"  OK rows: {len(rows_ok)}  |  Failed/skipped: {rows_fail}")
-    print("  Class counts:")
-    for cls, n in sorted(counts.items()):
-        print(f"    {cls:<25}: {n}")
+    print(f"  OK rows: {len(rows_ok)}  |  Failed/no-detection: {rows_fail}")
+    print(f"\n{'Class':<25} {'N_ok':>5} {'N_total':>7} {'MedSAM_ok%':>10} {'conf_mean':>9} {'conf_min':>8} {'conf_max':>8} {'conf_med':>8}")
+    print("-" * 90)
+    for cls in all_classes:
+        confs = conf_by_class.get(cls, [])
+        n_ok = len(ok_rows_by_class.get(cls, []))
+        n_total = len(all_rows_by_class.get(cls, []))
+        medsam_pct = 100 * n_ok / n_total if n_total else 0
+        c_mean = _stats.mean(confs) if confs else 0.0
+        c_min  = min(confs) if confs else 0.0
+        c_max  = max(confs) if confs else 0.0
+        c_med  = _stats.median(confs) if confs else 0.0
+        print(f"  {cls:<23} {n_ok:>5} {n_total:>7} {medsam_pct:>9.1f}% {c_mean:>9.3f} {c_min:>8.3f} {c_max:>8.3f} {c_med:>8.3f}")
+        analysis.append({
+            "class": cls, "n_ok": n_ok, "n_total": n_total,
+            "medsam_ok_pct": round(medsam_pct, 2),
+            "conf_mean": round(c_mean, 4), "conf_min": round(c_min, 4),
+            "conf_max": round(c_max, 4), "conf_median": round(c_med, 4),
+        })
+
+    analysis_path = FINAL_CSV.parent / "task_combine_class_analysis.json"
+    analysis_path.write_text(_json2.dumps({"total_ok": len(rows_ok), "classes": analysis}, indent=2))
+    print(f"\nPer-class analysis saved: {analysis_path}")
 
 
 def main() -> None:
