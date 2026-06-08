@@ -61,32 +61,23 @@ def _meaningful_guideline_items(items: list[str]) -> list[str]:
     return meaningful
 
 
-def _fill_zh_template(
+def _fill_report_template(
     case_id: str,
     summary: dict[str, Any],
     guidelines: Any,
-    guidelines_dir: Path,
 ) -> str:
-    """Fill the Chinese report template with available DB data.
+    """Fill the English report template with available DB data.
 
     Fields knowable from the pipeline are filled; clinical fields (specimen type,
     dates, history, treatment) are left as '—' for the clinician to complete.
     """
-    template_path = guidelines_dir / "report_template_zh.md"
-    if template_path.exists():
-        raw = template_path.read_text()
-        # Extract text inside the first ```text ... ``` block
-        import re as _re
-        m = _re.search(r"```text\s*(.*?)```", raw, _re.DOTALL)
-        template_body = m.group(1).strip() if m else raw
-    else:
-        template_body = (
-            "I. Specimen Information\n- Specimen type:\n- Collection date/time:\n- Received date/time:\n- Examination:\n\n"
-            "II. Clinical Data\n- Clinical diagnosis/question:\n- Relevant history:\n- Recent treatment or tests:\n\n"
-            "III. Findings\n- Peripheral blood morphology:\n- Bone marrow smear/biopsy findings:\n- Special stains / flow cytometry / molecular or cytogenetics:\n\n"
-            "IV. Interpretation\n- Main morphological findings:\n- Relevance to clinical question:\n- Items to exclude or confirm:\n\n"
-            "V. Conclusion/Opinion\n- Conclusion:\n- Recommendation:\n- Urgent review or notification required:"
-        )
+    template_body = (
+        "I. Specimen Information\n- Specimen type:\n- Collection date/time:\n- Received date/time:\n- Examination:\n\n"
+        "II. Clinical Data\n- Clinical diagnosis/question:\n- Relevant history:\n- Recent treatment or tests:\n\n"
+        "III. Findings\n- Peripheral blood morphology:\n- Bone marrow smear/biopsy findings:\n- Special stains / flow cytometry / molecular or cytogenetics:\n\n"
+        "IV. Interpretation\n- Main morphological findings:\n- Relevance to clinical question:\n- Items to exclude or confirm:\n\n"
+        "V. Conclusion/Opinion\n- Conclusion:\n- Recommendation:\n- Urgent review or notification required:"
+    )
 
     # Build per-field fill values from summary
     hard_counts: dict[str, int] = summary.get("hard_counts", {})
@@ -162,7 +153,7 @@ def _fill_zh_template(
                 indent = "- " if line.lstrip().startswith("-") else ""
                 # Multi-line values: indent continuation lines
                 value_lines = value.splitlines()
-                out_lines.append(f"{indent}{prefix}{value_lines[0]}")
+                out_lines.append(f"{indent}{prefix} {value_lines[0]}")
                 for vl in value_lines[1:]:
                     out_lines.append(f"    {vl}")
                 matched = True
@@ -663,7 +654,7 @@ class AgentTools:
     def generate_case_report(self, case_id: str) -> dict[str, Any]:
         summary = self.summarize_case(case_id)
         guidelines = load_reporting_guidelines(self.guidelines_dir)
-        content = _fill_zh_template(case_id, summary, guidelines, Path(self.guidelines_dir))
+        content = _fill_report_template(case_id, summary, guidelines)
         safety = validate_report_safety(content, guidelines)
         if not safety["safe"]:
             raise ValueError(f"report violates prohibited claims: {safety['violations']}")
