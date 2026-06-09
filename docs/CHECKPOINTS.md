@@ -1,36 +1,58 @@
 # Checkpoints
 
-Large model checkpoints must stay out of git. Put them in the expected local paths after downloading or copying from the team drive.
+Large model checkpoints are hosted on Dropbox. Download them to the expected local paths before running the pipeline.
 
-## Required Local Files
+## Download Links
 
-| Module | Expected path | Notes |
-|---|---|---|
-| YOLO | `best.pt` | BCCD-trained YOLO detector, classes: RBC / WBC / Platelets |
-| ConvNet baseline | `../artifacts/checkpoints/convnet/best_flat_convnext.pth` or another path passed with `--ckpt` | Existing classifier checkpoint; new retraining writes `convnet_runs/{config}/best.pth` |
-| MedSAM LoRA | `MedSAM3/outputs/sam3_lora_lisc/best_lora_weights.pt` | Used with `MedSAM3/configs/lisc_lora_config.yaml` |
+| Module | File | Size | Download |
+|---|---|---|---|
+| YOLO detector | `best.pt` | 49 MB | [Download](https://www.dropbox.com/scl/fi/ttpbyx7absp7qmcz3il53/best.pt?rlkey=u77bj7qdm578nuyriolag8aij&dl=1) |
+| MedSAM LoRA | `best_lora_weights.pt` | 71 MB | [Download](https://www.dropbox.com/scl/fi/ngrejttw0s4bauiayvr2q/best_lora_weights.pt?rlkey=ju2j7kq9zhbnz17nqqndxm49g&dl=1) |
+| WBC Classifier (16-class) | `best.pth` | 329 MB | [Download](https://www.dropbox.com/scl/fi/tyfofld9dj0u3wl3f5okp/best.pth?rlkey=twfstmk0kjodcixha79768b0p&dl=1) |
+| DinoBloom backbone | `DinoBloom-B.pth` | 504 MB | [Download](https://www.dropbox.com/scl/fi/lj92f3hjbaufq09z2yufr/DinoBloom-B.pth?rlkey=cc1uhe5n8bn1dc4nzjyicmjfw&dl=1) |
 
-## How To Obtain
+## Required Local Paths
 
-Do not push checkpoints to GitHub. Use one of these local-only options:
+```
+techbio_final-project/
+├── best.pt                                                    # YOLO detector
+└── MedSAM3/outputs/sam3_lora_lisc/best_lora_weights.pt       # MedSAM LoRA
 
-```bash
-# Option A: copy from a mounted team folder
-cp /path/to/team/checkpoints/best.pt techbio_final-project/best.pt
-mkdir -p techbio_final-project/MedSAM3/outputs/sam3_lora_lisc
-cp /path/to/team/checkpoints/best_lora_weights.pt   techbio_final-project/MedSAM3/outputs/sam3_lora_lisc/best_lora_weights.pt
-mkdir -p artifacts/checkpoints/convnet
-cp /path/to/team/checkpoints/best_flat_convnext.pth   artifacts/checkpoints/convnet/best_flat_convnext.pth
+artifacts/checkpoints/
+├── convnet/task_combine_dinobloom/best.pth                    # WBC Classifier
+└── dinobloom/DinoBloom-B.pth                                  # DinoBloom backbone
 ```
 
-If the team uses Google Drive or another file host, download manually or with the approved local tool, then verify file size and path. Keep links in private team notes, not in public git history if access is restricted.
+## Setup Commands
+
+```bash
+# YOLO
+wget -O techbio_final-project/best.pt \
+  "https://www.dropbox.com/scl/fi/ttpbyx7absp7qmcz3il53/best.pt?rlkey=u77bj7qdm578nuyriolag8aij&dl=1"
+
+# MedSAM LoRA
+mkdir -p techbio_final-project/MedSAM3/outputs/sam3_lora_lisc
+wget -O techbio_final-project/MedSAM3/outputs/sam3_lora_lisc/best_lora_weights.pt \
+  "https://www.dropbox.com/scl/fi/ngrejttw0s4bauiayvr2q/best_lora_weights.pt?rlkey=ju2j7kq9zhbnz17nqqndxm49g&dl=1"
+
+# WBC Classifier
+mkdir -p artifacts/checkpoints/convnet/task_combine_dinobloom
+wget -O artifacts/checkpoints/convnet/task_combine_dinobloom/best.pth \
+  "https://www.dropbox.com/scl/fi/tyfofld9dj0u3wl3f5okp/best.pth?rlkey=twfstmk0kjodcixha79768b0p&dl=1"
+
+# DinoBloom backbone
+mkdir -p artifacts/checkpoints/dinobloom
+wget -O artifacts/checkpoints/dinobloom/DinoBloom-B.pth \
+  "https://www.dropbox.com/scl/fi/lj92f3hjbaufq09z2yufr/DinoBloom-B.pth?rlkey=cc1uhe5n8bn1dc4nzjyicmjfw&dl=1"
+```
 
 ## Verification
 
 ```bash
-ls -lh techbio_final-project/best.pt
-ls -lh techbio_final-project/MedSAM3/outputs/sam3_lora_lisc/best_lora_weights.pt
-ls -lh artifacts/checkpoints/convnet/best_flat_convnext.pth
+ls -lh techbio_final-project/best.pt                                                   # ~49 MB
+ls -lh techbio_final-project/MedSAM3/outputs/sam3_lora_lisc/best_lora_weights.pt      # ~71 MB
+ls -lh artifacts/checkpoints/convnet/task_combine_dinobloom/best.pth                   # ~329 MB
+ls -lh artifacts/checkpoints/dinobloom/DinoBloom-B.pth                                 # ~504 MB
 ```
 
 Never load unknown external `.pth` files unless you trust the source. PyTorch checkpoints can execute pickle deserialization in older loading modes.
