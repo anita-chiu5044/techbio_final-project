@@ -32,7 +32,7 @@ DEFAULT_OUTPUT_ROOT = Path("/home/yucheng/Desktop/techbio_pipeline_output/full_a
 DEFAULT_YOLO = REPO_ROOT / "best.pt"
 DEFAULT_MEDSAM_CONFIG = REPO_ROOT / "MedSAM3" / "configs" / "lisc_lora_config.yaml"
 DEFAULT_MEDSAM_DIR = REPO_ROOT / "MedSAM3"
-DEFAULT_CLASSIFIER = Path("/home/yucheng/Desktop/techbio_pipeline_output/convnet_runs/dinobloom_ce_uniform/best.pth")
+DEFAULT_CLASSIFIER = Path("/home/yucheng/Desktop/techbio/artifacts/checkpoints/convnet/task_combine_dinobloom/best.pth")
 DEFAULT_GUIDELINES = WORKSPACE_ROOT / "reporting_guidelines"
 
 

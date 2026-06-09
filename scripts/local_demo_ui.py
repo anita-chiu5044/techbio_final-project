@@ -38,9 +38,9 @@ DEFAULT_OUTPUT_ROOT = Path("/home/yucheng/Desktop/techbio_pipeline_output/full_a
 DEFAULT_UPLOAD_ROOT = Path("/home/yucheng/Desktop/techbio_pipeline_output/full_agent_uploads")
 DEFAULT_CLASSIFIER = Path("/home/yucheng/Desktop/techbio/artifacts/checkpoints/convnet/task_combine_dinobloom/best.pth")
 DEFAULT_GUIDELINES = WORKSPACE_ROOT / "reporting_guidelines"
-DEFAULT_YOLO_PYTHON = os.environ.get("YMCA_YOLO_PYTHON", "/home/yucheng/miniconda3/envs/AICUP/bin/python")
-DEFAULT_MEDSAM_PYTHON = os.environ.get("YMCA_MEDSAM_PYTHON", sys.executable)
-DEFAULT_CLASSIFIER_PYTHON = os.environ.get("YMCA_CLASSIFIER_PYTHON", sys.executable)
+DEFAULT_YOLO_PYTHON = os.environ.get("YMCA_YOLO_PYTHON", "/home/yucheng/miniconda3/envs/techbio/bin/python")
+DEFAULT_MEDSAM_PYTHON = os.environ.get("YMCA_MEDSAM_PYTHON", "/home/yucheng/miniconda3/envs/techbio/bin/python")
+DEFAULT_CLASSIFIER_PYTHON = os.environ.get("YMCA_CLASSIFIER_PYTHON", "/home/yucheng/miniconda3/envs/techbio/bin/python")
 DEFAULT_CLASSIFIER_WORKER_URL = os.environ.get("YMCA_CLASSIFIER_WORKER_URL")
 LABELS = [
     "apl_suspect", "artifact", "basophil", "early_pre_b", "eosinophil",
@@ -314,6 +314,9 @@ def apply_review(ctx: DemoContext, session_id: str, payload: dict) -> dict:
     label = payload.get("label")
     note = payload.get("note")
     reviewer_id = payload.get("reviewer_id") or "demo_clinician"
+    if action == "accept_all":
+        result = tools.accept_all_cells(ctx.case_id(session_id), reviewer_id=reviewer_id)
+        return {"review": result, "case": load_case(ctx, session_id)}
     if not cell_id:
         raise ValueError("cell_id is required")
     if action == "approve_gated":
@@ -473,7 +476,7 @@ def run_pipeline(ctx: DemoContext, fields: dict[str, str], files: list[tuple[str
     # YOLO processes only the new files in this upload.
     input_path = run_dir
     cmd = [
-        sys.executable, str(REPO_ROOT / "scripts" / "run_full_agent_pipeline.py"),
+        ctx.yolo_python, str(REPO_ROOT / "scripts" / "run_full_agent_pipeline.py"),
         "--input", str(input_path),
         "--session-id", session_id,
         "--user-id", fields.get("user_id", "demo_user"),
@@ -639,7 +642,10 @@ pre{white-space:pre-wrap;word-break:break-word;background:#f8fafc;padding:8px;bo
 
 <!-- Col 2: Cell List -->
 <div class='col'>
-  <div class='col-hdr'>Cells</div>
+  <div class='col-hdr' style='display:flex;align-items:center;justify-content:space-between'>
+    <span>Cells</span>
+    <button id='acceptAllBtn' onclick='acceptAllCells()' style='font-size:11px;padding:2px 8px;cursor:pointer'>Accept All Safe</button>
+  </div>
   <div id='cells' class='col-body' style='padding:0'></div>
 </div>
 
@@ -654,7 +660,7 @@ pre{white-space:pre-wrap;word-break:break-word;background:#f8fafc;padding:8px;bo
   <div class='col-hdr'>Chat Assistant</div>
   <div style='flex:1;display:flex;flex-direction:column;padding:0 12px 12px;gap:6px;min-height:0'>
     <div id='chatlog' class='chatlog'></div>
-    <textarea id='chatInput' rows='2' placeholder='summary / which cells are uncertain? / correct det_000001 to LYT / report'></textarea>
+    <textarea id='chatInput' rows='2' placeholder='summary / which cells are uncertain? / correct det_000001 to LYT'></textarea>
     <div class='row'><button class='primary' onclick='sendChat()' style='flex:1'>Send</button><button onclick='document.getElementById("chatlog").innerHTML=""'>Clear</button></div>
   </div>
 </div>
@@ -995,13 +1001,15 @@ async function hardDeleteCurrentCell(){
 
 async function review(action){if(!currentCell){alert('Select a cell first');return}const body={session_id:currentSession,action,cell_id:currentCell.cell_id};if(action==='correct')body.label=document.getElementById('labelSelect').value;try{const data=await api('/api/review',{method:'POST',body:JSON.stringify(body)});currentCase=data.case;currentCell=(currentCase.cells||[]).find(c=>c.cell_id===body.cell_id)||null;render();renderDetail()}catch(e){alert('Review failed: '+e.message)}}
 
+async function acceptAllCells(){const btn=document.getElementById('acceptAllBtn');if(btn){btn.disabled=true;btn.textContent='Accepting...'}try{const data=await api('/api/review',{method:'POST',body:JSON.stringify({session_id:currentSession,action:'accept_all'})});if(data.case){currentCase=data.case;render()}const r=data.review||{};const log=document.getElementById('chatlog');if(log){log.innerHTML+=`<div><b>Accept All:</b> accepted ${r.accepted_count||0}, blocked ${r.blocked_count||0} (hard QC flags), ${r.already_reviewed_count||0} already reviewed.</div>`;log.scrollTop=log.scrollHeight}}catch(e){alert('Accept all failed: '+e.message)}finally{if(btn){btn.disabled=false;btn.textContent='Accept All Safe'}}}
+
 let isSending=false;
 async function sendChat(){if(isSending)return;const msg=document.getElementById('chatInput').value.trim();if(!msg)return;isSending=true;const btn=document.querySelector('#reviewPage .col:last-child button.primary');if(btn){btn.disabled=true;btn.textContent='Sending...'}document.getElementById('chatInput').value='';const log=document.getElementById('chatlog');log.innerHTML+=`<div><b>You:</b> ${esc(msg)}</div>`;log.innerHTML+=`<div class="muted" id="typing">Agent is thinking...</div>`;log.scrollTop=log.scrollHeight;try{const data=await api('/api/chat',{method:'POST',body:JSON.stringify({session_id:currentSession,message:msg})});document.getElementById('typing')?.remove();const tag=data.mode==='qwen'?'<span class="chip ok">Qwen</span>':'<span class="chip">fallback</span>';log.innerHTML+=`<div><b>Agent</b> ${tag}: ${esc(data.answer||'done')}</div>`;if(data.tool_trace&&data.tool_trace.length){log.innerHTML+=`<details><summary class="muted">${data.tool_trace.length} tool call(s)</summary><pre>${esc(JSON.stringify(data.tool_trace,null,2))}</pre></details>`}if(data.case){currentCase=data.case;render()}}catch(e){document.getElementById('typing')?.remove();log.innerHTML+=`<div style="color:var(--bad)"><b>Error:</b> ${esc(e.message)}</div>`}finally{isSending=false;if(btn){btn.disabled=false;btn.textContent='Send'}}log.scrollTop=log.scrollHeight}
 
 /* Enter key to send */
 document.getElementById('chatInput').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendChat()}});
 
-document.getElementById('uploadForm').addEventListener('submit',async e=>{e.preventDefault();const fd=new FormData(e.target);fd.set('session_id',currentSession);const fileCount=(e.target.querySelector('input[type=file]')?.files||[]).length;const log=document.getElementById('chatlog');log.innerHTML+=`<div class="muted">Running pipeline for ${fileCount} uploaded file(s) in session <b>${esc(currentSession)}</b>...</div>`;try{const r=await fetch('/api/run_pipeline',{method:'POST',body:fd});const data=await r.json();if(!r.ok)throw new Error(data.error||'pipeline failed');await listSessions();if(data.case){currentCase=data.case;render();showPage('review')}log.innerHTML+=`<div class="muted">Pipeline done (code ${data.returncode}); server received ${data.input_image_count??'?'} image file(s).</div>`}catch(err){alert(err.message)}});
+document.getElementById('uploadForm').addEventListener('submit',async e=>{e.preventDefault();const fd=new FormData(e.target);fd.set('session_id',currentSession);const fileCount=(e.target.querySelector('input[type=file]')?.files||[]).length;const log=document.getElementById('chatlog');log.innerHTML+=`<div class="muted">Running pipeline for ${fileCount} uploaded file(s) in session <b>${esc(currentSession)}</b>...</div>`;try{const r=await fetch('/api/run_pipeline',{method:'POST',body:fd});const data=await r.json();if(!r.ok){if(data.log){log.innerHTML+=`<details open><summary style="color:var(--bad)">Pipeline failed (code ${data.returncode}) — click to see log</summary><pre style="font-size:10px;max-height:200px;overflow-y:auto;white-space:pre-wrap">${esc(data.log)}</pre></details>`}throw new Error(data.error||'pipeline failed')}await listSessions();if(data.case){currentCase=data.case;render();showPage('review')}log.innerHTML+=`<div class="muted">Pipeline done (code ${data.returncode}); server received ${data.input_image_count??'?'} image file(s).</div>`}catch(err){log.innerHTML+=`<div style="color:var(--bad)"><b>Error:</b> ${esc(err.message)}</div>`}});
 
 async function fetchAgentStatus(){try{const s=await api('/api/agent_status');const el=document.getElementById('agentStatus');if(s.agent_mode==='qwen'&&s.qwen_available){el.textContent='Qwen3-14B'+(s.qwen_loaded?' (ready)':' (lazy)');el.style.color='#1e8449'}else{el.textContent='Fallback mode';el.style.color='#5d6d7e'}}catch{}}
 fetchAgentStatus();
@@ -1028,7 +1036,15 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/":
                 text_response(self, HTML)
             elif parsed.path == "/api/sessions":
-                sessions = sorted(p.name for p in self.ctx.output_root.iterdir() if (p / "ymca_agent.db").exists())
+                def _has_cells(p):
+                    db = p / "ymca_agent.db"
+                    if not db.exists(): return False
+                    try:
+                        with sqlite3.connect(db) as c:
+                            return c.execute("SELECT 1 FROM cases LIMIT 1").fetchone() is not None
+                    except Exception:
+                        return False
+                sessions = sorted(p.name for p in self.ctx.output_root.iterdir() if _has_cells(p))
                 json_response(self, {"sessions": sessions})
             elif parsed.path == "/api/agent_status":
                 mode = self.ctx.agent_mode
@@ -1182,7 +1198,7 @@ class Handler(BaseHTTPRequestHandler):
                     else:
                         raise ValueError(f"Original input image not found for session: {session_id}")
                 cmd = [
-                    sys.executable, str(REPO_ROOT / "scripts" / "run_full_agent_pipeline.py"),
+                    self.ctx.yolo_python, str(REPO_ROOT / "scripts" / "run_full_agent_pipeline.py"),
                     "--input", str(input_path),
                     "--session-id", session_id,
                     "--case-id", case_id,
