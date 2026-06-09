@@ -56,3 +56,62 @@ These are all rare classes (< 30 training samples). Suggest: collect more data o
 ## Decision
 
 DinoBloom-B is deployed. DinoBloom-L underperforms across 13/16 classes despite 3.5× more parameters, likely due to insufficient training data for the larger model to generalize from the pretrained pos_embed (trained at 518×518, fine-tuned at 224×224 with filtered weights).
+
+---
+
+## Preprocessing Statistics (YOLO + MedSAM)
+
+### YOLO Detection Summary
+
+- Input images: **21,621**
+- Total detections: **327,771** (WBC: 94,388 / RBC: 196,316 / Platelets: 37,067)
+
+#### WBC YOLO Confidence Distribution
+
+| Range | Count |
+|-------|-------|
+| < 0.50 | 34,959 |
+| 0.50–0.60 | 12,102 |
+| 0.60–0.70 | 13,024 |
+| 0.70–0.80 | 23,439 |
+| 0.80–0.90 | 10,818 |
+| ≥ 0.90 | 46 |
+| **Mean / Median** | **0.578 / 0.601** |
+
+### Per-Class YOLO Confidence (final training set, 21,478 cells)
+
+| Class | N | Mean | Median | Min | Max |
+|-------|---|------|--------|-----|-----|
+| neutrophil | 8,524 | 0.758 | 0.763 | 0.252 | 0.900 |
+| mature_lymphocyte | 3,947 | 0.809 | 0.816 | 0.483 | 0.900 |
+| myelocyte | 3,263 | 0.761 | 0.762 | 0.256 | 0.881 |
+| monocyte | 1,756 | 0.704 | 0.725 | 0.255 | 0.868 |
+| early_pre_b | 973 | 0.822 | 0.829 | 0.516 | 0.950 |
+| pre_b | 961 | 0.839 | 0.842 | 0.587 | 0.955 |
+| pro_b | 793 | 0.760 | 0.796 | 0.255 | 0.934 |
+| hematogone | 498 | 0.839 | 0.851 | 0.565 | 0.961 |
+| eosinophil | 423 | 0.752 | 0.751 | 0.265 | 0.873 |
+| other_immature | 85 | 0.724 | 0.725 | 0.352 | 0.861 |
+| basophil | 78 | 0.781 | 0.782 | 0.564 | 0.861 |
+| erythroid | 78 | 0.809 | 0.813 | 0.719 | 0.872 |
+| myeloblast | 42 | 0.751 | 0.745 | 0.625 | 0.864 |
+| monoblast | 26 | 0.712 | 0.726 | 0.580 | 0.778 |
+| apl_suspect | 18 | 0.761 | 0.764 | 0.697 | 0.822 |
+| artifact | 13 | 0.756 | 0.747 | 0.644 | 0.858 |
+
+### MedSAM Results
+
+- Input patches: **21,504** → OK: **21,478** / NO_DETECTION: **26** (0.12% loss)
+
+#### Lost Images by Class (NO_DETECTION)
+
+| Class | Lost |
+|-------|------|
+| early_pre_b | 12 |
+| hematogone | 6 |
+| pro_b | 5 |
+| pre_b | 2 |
+| artifact | 1 |
+| **Total** | **26** |
+
+All 26 lost images had no logged fail_reason — MedSAM found no detection above threshold=0.5. These are predominantly lymphoid precursor cells (early_pre_b, hematogone, pro_b, pre_b), which tend to be small and may not produce a strong enough segmentation response.
