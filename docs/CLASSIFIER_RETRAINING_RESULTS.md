@@ -81,6 +81,15 @@ DinoBloom-B is deployed. DinoBloom-L underperforms across 13/16 classes despite 
 | ≥ 0.90 | 46 |
 | **Mean / Median** | **0.578 / 0.601** |
 
+#### Top-1 Selected WBC Confidence (final training set, 21,478 cells)
+
+| Stat | Value |
+|------|-------|
+| Mean | **0.7717** |
+| Median | 0.7742 |
+| Min | 0.2525 |
+| Max | 0.9608 |
+
 ### Per-Class YOLO Confidence (final training set, 21,478 cells)
 
 | Class | N | Mean | Median | Min | Max |
