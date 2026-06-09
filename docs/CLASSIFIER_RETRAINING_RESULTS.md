@@ -66,7 +66,10 @@ DinoBloom-B is deployed. DinoBloom-L underperforms across 13/16 classes despite 
 - Input images: **21,621**
 - Total detections: **327,771** (WBC: 94,388 / RBC: 196,316 / Platelets: 37,067)
 
-#### WBC YOLO Confidence Distribution
+#### WBC YOLO Confidence Distribution (all 94,388 detections, conf ≥ 0.25)
+
+> Note: includes all duplicate/overlapping boxes before NMS and top-1 selection.
+> The final training set (21,478 cells) uses only the top-1 WBC per image, so per-class means below are higher.
 
 | Range | Count |
 |-------|-------|
